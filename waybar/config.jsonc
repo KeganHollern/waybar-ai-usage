@@ -1,0 +1,53 @@
+// Merge into ~/.config/waybar/config.jsonc, then add "group/ai" to one of
+// your module lists, e.g.  "modules-right": ["group/ai", ...].
+//
+// Each provider is its own module: delete the ones you don't use here and
+// in the group below. Left-click any module to force a refresh.
+{
+    "group/ai": {
+        "orientation": "horizontal",
+        "modules": [
+            "custom/ai-codex",
+            "custom/ai-claude",
+            "custom/ai-grok",
+            "custom/ai-gemini",
+            "custom/ai-zai"
+        ]
+    },
+
+    "custom/ai-codex": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py codex",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-claude": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py claude",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-grok": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py grok",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-gemini": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py gemini",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-zai": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py zai",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    }
+}

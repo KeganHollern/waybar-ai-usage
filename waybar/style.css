@@ -1,0 +1,43 @@
+/* ===== AI usage island =====
+ * Append to ~/.config/waybar/style.css.
+ *
+ * Brand SVG icons (theme-tinted) are drawn as backgrounds; the percent text
+ * is colored by the script on a green->yellow->red gradient.
+ *
+ * Icon url()s are relative to style.css, so the icons must live in
+ * ~/.config/waybar/icons/ai/.
+ */
+
+/* The island container. Drop this block if you already style module groups. */
+#ai {
+    border: 2px solid transparent;
+    border-radius: 12px;
+    /* gradient-border trick: inner background clipped to padding-box,
+       border gradient clipped to border-box */
+    background-image: linear-gradient(rgba(17, 17, 27, 0.8), rgba(17, 17, 27, 0.8)),
+                      linear-gradient(45deg, #33ccff, #00ff99);
+    background-origin: border-box;
+    background-clip: padding-box, border-box;
+    padding: 2px 10px;
+    margin: 0 3px;
+    color: #ffffff;
+}
+
+#custom-ai-codex,
+#custom-ai-claude,
+#custom-ai-grok,
+#custom-ai-gemini,
+#custom-ai-zai {
+    background-color: transparent;
+    background-repeat: no-repeat;
+    background-position: left center;
+    background-size: 15px 15px;
+    padding: 0 7px 0 20px;
+    margin: 0;
+    color: #ffffff;
+}
+#custom-ai-codex  { background-image: url("icons/ai/openai.svg"); }
+#custom-ai-claude { background-image: url("icons/ai/claude.svg"); }
+#custom-ai-grok   { background-image: url("icons/ai/grok.svg"); }
+#custom-ai-gemini { background-image: url("icons/ai/gemini.svg"); }
+#custom-ai-zai    { background-image: url("icons/ai/zai.svg"); }
