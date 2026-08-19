@@ -25,7 +25,7 @@ known value is shown dimmed (up to 3 hours) before falling back to `--`.
 | Provider | Data source |
 |---|---|
 | `codex`, `claude`, `grok` | `omp usage --json` — the [Oh My Pi](https://github.com/acidsugarx/oh-my-pi) CLI aggregates these accounts |
-| `gemini` | `cloudcode-pa.googleapis.com` user quota API, using your existing `gemini-cli` login (`~/.gemini/oauth_creds.json`) |
+| `gemini` | `agy -p /usage --output-format json` — [Antigravity CLI](https://antigravity.google/docs/cli/getting-started) (`agy`). Falls back to the old `cloudcode-pa` quota API via `gemini-cli` OAuth (`~/.gemini/oauth_creds.json`) if `agy` is not signed in |
 | `zai` | `api.z.ai` quota API, token read from omp's credential store (`~/.omp/agent/agent.db`) |
 
 Each fetcher is a small self-contained function; if you don't use one of
@@ -37,7 +37,7 @@ these tools, adapting a fetcher to your own token source is a ~40-line job.
 - Python 3 (stdlib only — no pip packages)
 - Per provider:
   - **codex / claude / grok** — `omp` CLI, logged into the accounts
-  - **gemini** — `gemini-cli`, logged in via Google OAuth
+  - **gemini** — `agy` (Antigravity CLI), signed in via Google; or `gemini-cli` as a fallback
   - **zai** — a Z.AI credential in omp's store
 
 ## Install
@@ -88,13 +88,14 @@ quietly into the shared cache, so removing the module is all that's needed.
 
 ## Notes
 
-- The Gemini client ID/secret embedded in the script belong to
-  **gemini-cli's public installed-app OAuth client** — they ship in
+- Gemini quota is read from `agy` first (Google replaced Gemini CLI with
+  Antigravity CLI). The Gemini client ID/secret still embedded in the script
+  belong to **gemini-cli's public installed-app OAuth client** — they ship in
   [gemini-cli's source](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts)
   and are not a leaked secret (Google's docs: for installed apps, "the client
-  secret is obviously not treated as a secret"). The script only *reads* your
-  `gemini-cli` refresh token and caches its own access token; it never writes
-  to gemini-cli's files.
+  secret is obviously not treated as a secret"). They are only used for the
+  `gemini-cli` fallback: the script *reads* that refresh token and caches its
+  own access token; it never writes to gemini-cli's files.
 - The script runs read-only against provider APIs and local credential
   stores; the only state it writes lives in `~/.cache/waybar-ai-usage/`.
 - Provider logos are trademarks of their respective owners, used here solely

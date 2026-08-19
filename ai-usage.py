@@ -9,9 +9,9 @@ gradient matching the desktop theme.
 
 Data sources:
   codex/claude/grok : `omp usage --json` (Oh My Pi aggregates these accounts)
-  gemini            : cloudcode-pa.googleapis.com retrieveUserQuota
-                      (OAuth creds from ~/.gemini/oauth_creds.json, refreshed
-                      with gemini-cli's public OAuth client when expired)
+  gemini            : `agy -p /usage` (Antigravity CLI). Falls back to
+                      cloudcode-pa retrieveUserQuota via gemini-cli OAuth
+                      (~/.gemini/oauth_creds.json) if agy is not signed in.
   zai               : api.z.ai quota API (token from omp's credential store)
 
 All five module instances share one cache (~/.cache/waybar-ai-usage) guarded
@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
 CACHE_DIR = os.path.join(HOME, ".cache", "waybar-ai-usage")
@@ -88,6 +89,30 @@ def fmt_reset(ms):
     if ts - time.time() < 22 * 3600:
         return time.strftime("%H:%M", lt)
     return time.strftime("%a %H:%M", lt)
+
+
+def fmt_reset_value(value):
+    """Format a reset time given as ms/sec epoch or ISO-8601."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+        return fmt_reset(n if n > 1e12 else n * 1000.0)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        n = float(s)
+        return fmt_reset(n if n > 1e12 else n * 1000.0)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return fmt_reset(dt.timestamp() * 1000.0)
+    except ValueError:
+        return None
 
 
 def http_json(url, headers=None, body=None, timeout=15):
@@ -160,6 +185,127 @@ def fetch_omp():
     return results
 
 
+def agy_binary():
+    """Waybar runs with a bare PATH (/bin:/usr/bin); find agy explicitly."""
+    env = os.environ.get("ANTIGRAVITY_CLI_PATH")
+    if env and os.access(env, os.X_OK):
+        return env
+    found = shutil.which("agy")
+    if found:
+        return found
+    for cand in (os.path.join(HOME, ".local", "bin", "agy"),
+                 "/usr/local/bin/agy", "/opt/homebrew/bin/agy", "/usr/bin/agy"):
+        if os.access(cand, os.X_OK):
+            return cand
+    raise FileNotFoundError("agy CLI not found")
+
+
+def _bucket_fraction(bucket):
+    frac = bucket.get("remaining_fraction")
+    if frac is None:
+        frac = bucket.get("remainingFraction")
+    if frac is None:
+        rem = bucket.get("remaining")
+        if isinstance(rem, dict):
+            frac = rem.get("remainingFraction", rem.get("remaining_fraction"))
+        elif isinstance(rem, (int, float)):
+            frac = rem
+    return None if frac is None else float(frac)
+
+
+def _bucket_reset(bucket):
+    return (bucket.get("reset_time") or bucket.get("resetTime")
+            or bucket.get("resetsAt"))
+
+
+def _window_label(bucket):
+    window = (bucket.get("window") or "").lower()
+    bid = (bucket.get("id") or bucket.get("bucketId") or "").lower()
+    name = bucket.get("name") or bucket.get("displayName") or ""
+    blob = " ".join((window, bid, name.lower()))
+    if window == "weekly" or "week" in blob:
+        return "weekly"
+    if window in ("5h", "5hr", "five_hour") or "5h" in blob or "five hour" in blob:
+        return "5h"
+    return name or window or bid or "?"
+
+
+def _is_weekly_bucket(bucket):
+    return _window_label(bucket) == "weekly"
+
+
+def parse_agy_usage(payload):
+    """Turn agy `/usage` JSON (or its TSV `response`) into {pct, lines}."""
+    data = (payload.get("command") or {}).get("data") or {}
+    groups = data.get("groups") or []
+    lines = []
+    weekly = []
+    all_fracs = []
+
+    for group in groups:
+        gname = group.get("name") or group.get("displayName") or "Quota"
+        for bucket in group.get("buckets") or []:
+            frac = _bucket_fraction(bucket)
+            if frac is None:
+                continue
+            all_fracs.append(frac)
+            if _is_weekly_bucket(bucket):
+                weekly.append(frac)
+            line = "{} {}: {}% left".format(
+                gname, _window_label(bucket), round(frac * 100))
+            reset = fmt_reset_value(_bucket_reset(bucket))
+            if reset:
+                line += "  (resets {})".format(reset)
+            lines.append(line)
+
+    if not all_fracs:
+        # print-mode also emits a tab-separated snapshot in `response`
+        for raw in str(payload.get("response") or "").splitlines():
+            parts = raw.split("\t")
+            if len(parts) < 3:
+                continue
+            gname, bname, pcts = parts[0], parts[1], parts[2]
+            try:
+                frac = float(pcts.strip().rstrip("%")) / 100.0
+            except ValueError:
+                continue
+            bucket = {"name": bname, "window": bname}
+            all_fracs.append(frac)
+            if _is_weekly_bucket(bucket):
+                weekly.append(frac)
+            line = "{} {}: {}% left".format(
+                gname, _window_label(bucket), round(frac * 100))
+            reset = fmt_reset_value(parts[3] if len(parts) > 3 else None)
+            if reset:
+                line += "  (resets {})".format(reset)
+            lines.append(line)
+
+    if not all_fracs:
+        raise ValueError("agy /usage returned no quota buckets")
+    # Bar shows the tightest weekly pool (Gemini vs Claude/GPT); tooltip lists all.
+    return {"pct": min(weekly or all_fracs) * 100, "lines": lines}
+
+
+def fetch_agy():
+    """Antigravity CLI: `agy -p /usage` is a no-quota slash command."""
+    proc = subprocess.run(
+        [agy_binary(), "-p", "/usage", "--output-format", "json",
+         "--print-timeout", "30s"],
+        capture_output=True, text=True, timeout=45,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise RuntimeError(err[-1] if err else "agy exit %s" % proc.returncode)
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError as e:
+        raise ValueError("agy /usage: invalid JSON") from e
+    status = payload.get("status")
+    if status and status != "SUCCESS":
+        raise ValueError("agy /usage: " + str(status))
+    return parse_agy_usage(payload)
+
+
 def gemini_access_token():
     with open(os.path.join(HOME, ".gemini", "oauth_creds.json")) as f:
         creds = json.load(f)
@@ -190,7 +336,8 @@ def gemini_access_token():
     return access
 
 
-def fetch_gemini():
+def fetch_gemini_cli():
+    """Legacy gemini-cli OAuth + cloudcode-pa retrieveUserQuota."""
     token = gemini_access_token()
     headers = {"Authorization": "Bearer " + token,
                "Content-Type": "application/json"}
@@ -219,10 +366,27 @@ def fetch_gemini():
     lines = []
     for model, (frac, reset) in sorted(per_model.items(), key=lambda kv: kv[1][0]):
         line = "{}: {}% left".format(model, round(frac * 100))
-        if reset:
-            line += "  (resets {})".format(reset.replace("T", " ").rstrip("Z") + "Z")
+        pretty = fmt_reset_value(reset)
+        if pretty:
+            line += "  (resets {})".format(pretty)
+        elif reset:
+            line += "  (resets {})".format(
+                str(reset).replace("T", " ").rstrip("Z") + "Z")
         lines.append(line)
     return {"pct": pct, "lines": lines}
+
+
+def fetch_gemini():
+    errors = []
+    try:
+        return fetch_agy()
+    except Exception as e:
+        errors.append("agy: %s" % e)
+    try:
+        return fetch_gemini_cli()
+    except Exception as e:
+        errors.append("gemini-cli: %s" % e)
+    raise ValueError("; ".join(errors))
 
 
 def fetch_zai():
