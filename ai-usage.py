@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Waybar AI subscription usage module.
 
-Usage: ai-usage.py <codex|claude|grok|gemini|zai>
+Usage: ai-usage.py <codex|claude|grok|gemini|zai|openrouter>
 
-Prints one waybar custom-module JSON line for the given provider, showing
-percent of the weekly quota remaining, colored on a green->yellow->red
-gradient matching the desktop theme.
+Prints one Waybar custom-module JSON line for the given provider. Subscription
+modules show the weekly percentage. OpenRouter shows the USD credit balance.
+Values use a green->yellow->red gradient that matches the desktop theme.
 
 Data sources:
   codex/claude/grok : `omp usage --json` (Oh My Pi aggregates these accounts)
@@ -13,13 +13,16 @@ Data sources:
                       cloudcode-pa retrieveUserQuota via gemini-cli OAuth
                       (~/.gemini/oauth_creds.json) if agy is not signed in.
   zai               : api.z.ai quota API (token from omp's credential store)
+  openrouter        : OpenRouter credits and API key management APIs
 
-All five module instances share one cache (~/.cache/waybar-ai-usage) guarded
+All module instances share one cache (~/.cache/waybar-ai-usage) guarded
 by a lock file, so a bar refresh performs a single fetch pass.
 """
 
 import fcntl
+import html
 import json
+import math
 import os
 import sqlite3
 import shutil
@@ -36,17 +39,25 @@ CACHE_DIR = os.path.join(HOME, ".cache", "waybar-ai-usage")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOCK_PATH = os.path.join(CACHE_DIR, "lock")
 GEMINI_TOKEN_CACHE = os.path.join(CACHE_DIR, "gemini-token.json")
+DEFAULT_CONFIG_HOME = os.path.join(HOME, ".config")
+XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", "")
+CONFIG_HOME = (XDG_CONFIG_HOME if os.path.isabs(XDG_CONFIG_HOME)
+               else DEFAULT_CONFIG_HOME)
+OPENROUTER_KEY_PATH = os.path.join(
+    CONFIG_HOME, "waybar-ai-usage", "openrouter-management-key")
+OPENROUTER_API = "https://openrouter.ai/api/v1"
 
 TTL = 300  # seconds a fetched state stays fresh
 STALE_LIMIT = 3 * 3600  # drop carried-over data older than this
 
-PROVIDERS = ("codex", "claude", "grok", "gemini", "zai")
+PROVIDERS = ("codex", "claude", "grok", "gemini", "zai", "openrouter")
 NAMES = {
     "codex": "OpenAI Codex",
     "claude": "Claude",
     "grok": "Grok",
     "gemini": "Gemini",
     "zai": "Z.AI",
+    "openrouter": "OpenRouter",
 }
 
 # Theme colors (must match waybar style.css)
@@ -54,6 +65,7 @@ GREEN = (0x00, 0xFF, 0x99)   # @secondary-color
 YELLOW = (0xFF, 0xEE, 0x66)
 RED = (0xFF, 0x66, 0x66)     # @alert-color
 DIM = "#66667a"
+EXHAUSTED_COLOR = "#ffcc66"
 
 # gemini-cli's installed-app OAuth client, shipped in plaintext in the CLI's
 # own public source (see README). Per Google's OAuth docs, installed-app
@@ -115,6 +127,43 @@ def fmt_reset_value(value):
         return None
 
 
+def finite_number(value):
+    """Return a finite float, or None for missing and invalid values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def epoch_ms(value):
+    """Convert a second/ms epoch or ISO-8601 value to epoch milliseconds."""
+    number = finite_number(value)
+    if number is not None:
+        return number if number > 1e12 else number * 1000.0
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp() * 1000.0
+
+
+def money(value):
+    """Format an OpenRouter USD amount without hiding small charges."""
+    amount = finite_number(value)
+    if amount is None:
+        return "$--"
+    if 0 < abs(amount) < 0.01:
+        return "${:,.4f}".format(amount)
+    return "${:,.2f}".format(amount)
+
+
 def http_json(url, headers=None, body=None, timeout=15):
     data = None
     if body is not None:
@@ -125,7 +174,7 @@ def http_json(url, headers=None, body=None, timeout=15):
 
 
 # --------------------------------------------------------------------------
-# Fetchers: each returns {"pct": float, "lines": [tooltip lines]}
+# Fetchers return a color percentage, display data, and tooltip lines.
 # --------------------------------------------------------------------------
 
 def omp_binary():
@@ -140,20 +189,44 @@ def omp_binary():
     raise FileNotFoundError("omp CLI not found")
 
 
-def fetch_omp():
-    """One omp call feeds codex, claude, and grok."""
-    out = subprocess.run(
-        [omp_binary(), "usage", "--json"],
-        capture_output=True, text=True, timeout=90, check=True,
-    ).stdout
-    reports = {r.get("provider"): r for r in json.loads(out).get("reports", [])}
+OMP_BLOCKING_IDS = {
+    # Product/model-specific rows are alternatives, not provider-wide gates.
+    "codex": {"openai-codex:primary", "openai-codex:secondary"},
+    "claude": {"anthropic:5h", "anthropic:7d"},
+    "grok": {"xai-oauth:credits:1w", "xai-oauth:included:1mo"},
+}
+
+
+def _omp_limit_exhausted(limit):
+    """Use OMP's state first and an exact fraction for older OMP versions."""
+    status = limit.get("status")
+    if status is not None:
+        return str(status).lower() == "exhausted"
+    fraction = finite_number((limit.get("amount") or {}).get(
+        "remainingFraction"))
+    return fraction is not None and fraction <= 0
+
+
+def parse_omp_usage(payload):
+    """Parse OMP usage and keep alternative accounts as usable paths."""
+    reports = {}
+    for report in payload.get("reports", []):
+        reports.setdefault(report.get("provider"), []).append(report)
+    unknown_providers = {
+        account.get("provider")
+        for account in payload.get("accountsWithoutUsage", [])
+        if account.get("provider")
+    }
     results = {}
 
-    def pick(report, primary_id):
+    def pick(report, primary_ids):
+        if isinstance(primary_ids, str):
+            primary_ids = (primary_ids,)
         limits = report.get("limits", [])
-        for lim in limits:
-            if lim.get("id") == primary_id:
-                return lim
+        for primary_id in primary_ids:
+            for lim in limits:
+                if lim.get("id") == primary_id:
+                    return lim
         for lim in limits:
             if lim.get("window", {}).get("id") in ("7d", "1w"):
                 return lim
@@ -170,19 +243,92 @@ def fetch_omp():
     for key, provider, primary in (
         ("codex", "openai-codex", "openai-codex:primary"),
         ("claude", "anthropic", "anthropic:7d"),
-        ("grok", "xai-oauth", "xai-oauth:credits:1w"),
+        ("grok", "xai-oauth",
+         ("xai-oauth:credits:1w", "xai-oauth:included:1mo")),
     ):
-        rep = reports.get(provider)
-        if not rep:
+        provider_reports = reports.get(provider) or []
+        if not provider_reports:
             continue
-        main = pick(rep, primary)
-        if not main:
+        parsed_reports = []
+        for rep in provider_reports:
+            main = pick(rep, primary)
+            if not main:
+                continue
+            blockers = []
+            blocking_ids = OMP_BLOCKING_IDS.get(key, set())
+            for limit in rep.get("limits", []):
+                if limit.get("id") not in blocking_ids:
+                    continue
+                if not _omp_limit_exhausted(limit):
+                    continue
+                blockers.append({
+                    "label": limit.get("label") or "quota",
+                    "resets_at": epoch_ms(
+                        (limit.get("window") or {}).get("resetsAt")),
+                })
+
+            # One report is one account. For Grok, included quota and
+            # on-demand billing can be two alternatives inside that account.
+            paths = [blockers] if blockers else []
+            if key == "grok":
+                on_demand = [limit for limit in rep.get("limits", [])
+                             if limit.get("id") == "xai-oauth:on-demand"]
+                if on_demand:
+                    on_demand_blockers = [{
+                        "label": limit.get("label") or "On-demand",
+                        "resets_at": epoch_ms(
+                            (limit.get("window") or {}).get("resetsAt")),
+                    } for limit in on_demand if _omp_limit_exhausted(limit)]
+                    paths = ([blockers, on_demand_blockers]
+                             if blockers and on_demand_blockers else [])
+                    blockers = blockers + on_demand_blockers if paths else []
+
+            parsed_reports.append({
+                "pct": main["amount"]["remainingFraction"] * 100,
+                "lines": [limit_line(limit)
+                          for limit in rep.get("limits", [])],
+                "blockers": blockers,
+                "paths": paths,
+            })
+
+        if not parsed_reports:
             continue
+        # Accounts are alternatives. The provider is out only when each
+        # account (and each billing lane in that account) is blocked.
+        exhausted = (provider not in unknown_providers
+                     and all(report["paths"] for report in parsed_reports))
+        blocker_paths = ([path for report in parsed_reports
+                          for path in report["paths"]] if exhausted else [])
+        blockers = ([blocker for path in blocker_paths for blocker in path]
+                    if exhausted else [])
+        lines = []
+        for index, report in enumerate(parsed_reports, start=1):
+            if len(parsed_reports) > 1:
+                lines.append("Account {}:".format(index))
+                lines.extend("  " + line for line in report["lines"])
+            else:
+                lines.extend(report["lines"])
+        if provider in unknown_providers:
+            lines.append("Another account: usage unavailable")
+        display_reports = ([report for report in parsed_reports
+                            if not report["paths"]] or parsed_reports)
         results[key] = {
-            "pct": main["amount"]["remainingFraction"] * 100,
-            "lines": [limit_line(l) for l in rep.get("limits", [])],
+            "pct": max(report["pct"] for report in display_reports),
+            "lines": lines,
+            "exhausted": exhausted,
+            "blockers": blockers,
+            "blocker_paths": blocker_paths,
         }
     return results
+
+
+def fetch_omp():
+    """One omp call feeds codex, claude, and grok."""
+    out = subprocess.run(
+        [omp_binary(), "usage", "--json"],
+        capture_output=True, text=True, timeout=90, check=True,
+    ).stdout
+    return parse_omp_usage(json.loads(out))
 
 
 def agy_binary():
@@ -241,14 +387,18 @@ def parse_agy_usage(payload):
     lines = []
     weekly = []
     all_fracs = []
+    paths = []
 
     for group in groups:
         gname = group.get("name") or group.get("displayName") or "Quota"
+        group_fracs = []
+        group_blockers = []
         for bucket in group.get("buckets") or []:
             frac = _bucket_fraction(bucket)
             if frac is None:
                 continue
             all_fracs.append(frac)
+            group_fracs.append(frac)
             if _is_weekly_bucket(bucket):
                 weekly.append(frac)
             line = "{} {}: {}% left".format(
@@ -257,9 +407,17 @@ def parse_agy_usage(payload):
             if reset:
                 line += "  (resets {})".format(reset)
             lines.append(line)
+            if frac <= 0:
+                group_blockers.append({
+                    "label": "{} {}".format(gname, _window_label(bucket)),
+                    "resets_at": epoch_ms(_bucket_reset(bucket)),
+                })
+        if group_fracs:
+            paths.append(group_blockers)
 
     if not all_fracs:
         # print-mode also emits a tab-separated snapshot in `response`
+        tsv_paths = {}
         for raw in str(payload.get("response") or "").splitlines():
             parts = raw.split("\t")
             if len(parts) < 3:
@@ -271,6 +429,7 @@ def parse_agy_usage(payload):
                 continue
             bucket = {"name": bname, "window": bname}
             all_fracs.append(frac)
+            tsv_paths.setdefault(gname, [])
             if _is_weekly_bucket(bucket):
                 weekly.append(frac)
             line = "{} {}: {}% left".format(
@@ -279,11 +438,27 @@ def parse_agy_usage(payload):
             if reset:
                 line += "  (resets {})".format(reset)
             lines.append(line)
+            if frac <= 0:
+                tsv_paths[gname].append({
+                    "label": "{} {}".format(gname, _window_label(bucket)),
+                    "resets_at": epoch_ms(
+                        parts[3] if len(parts) > 3 else None),
+                })
+        paths = list(tsv_paths.values())
 
     if not all_fracs:
         raise ValueError("agy /usage returned no quota buckets")
     # Bar shows the tightest weekly pool (Gemini vs Claude/GPT); tooltip lists all.
-    return {"pct": min(weekly or all_fracs) * 100, "lines": lines}
+    exhausted = bool(paths) and all(paths)
+    blockers = [blocker for path in paths for blocker in path] if exhausted else []
+    return {
+        "pct": min(weekly or all_fracs) * 100,
+        "lines": lines,
+        "exhausted": exhausted,
+        "blockers": blockers,
+        # Each group is an alternative usage path. Every path must be blocked.
+        "blocker_paths": paths if exhausted else [],
+    }
 
 
 def fetch_agy():
@@ -373,7 +548,20 @@ def fetch_gemini_cli():
             line += "  (resets {})".format(
                 str(reset).replace("T", " ").rstrip("Z") + "Z")
         lines.append(line)
-    return {"pct": pct, "lines": lines}
+    exhausted = all(frac <= 0 for frac, _ in per_model.values())
+    blockers = []
+    if exhausted:
+        blockers = [{"label": model, "resets_at": epoch_ms(reset)}
+                    for model, (frac, reset) in per_model.items()
+                    if frac <= 0]
+    return {
+        "pct": pct,
+        "lines": lines,
+        "exhausted": exhausted,
+        "blockers": blockers,
+        "blocker_paths": ([[blocker] for blocker in blockers]
+                          if exhausted else []),
+    }
 
 
 def fetch_gemini():
@@ -387,6 +575,81 @@ def fetch_gemini():
     except Exception as e:
         errors.append("gemini-cli: %s" % e)
     raise ValueError("; ".join(errors))
+
+
+def _zai_remaining_pct(limit):
+    used_pct = finite_number(limit.get("percentage"))
+    if used_pct is not None:
+        return 100.0 - max(0.0, min(100.0, used_pct))
+    remaining = finite_number(limit.get("remaining"))
+    allowance = finite_number(limit.get("usage"))
+    if remaining is not None and allowance and allowance > 0:
+        return max(0.0, min(100.0, remaining / allowance * 100.0))
+    current = finite_number(limit.get("currentValue"))
+    if current is not None and allowance and allowance > 0:
+        return max(0.0, min(100.0,
+                            (allowance - current) / allowance * 100.0))
+    return None
+
+
+def _zai_limit_exhausted(limit):
+    """Use exact Z.AI counts before its rounded percentage."""
+    remaining = finite_number(limit.get("remaining"))
+    if remaining is not None:
+        return remaining <= 0
+    allowance = finite_number(limit.get("usage"))
+    current = finite_number(limit.get("currentValue"))
+    if allowance is not None and allowance > 0 and current is not None:
+        return current >= allowance
+    used_pct = finite_number(limit.get("percentage"))
+    return used_pct is not None and used_pct >= 100
+
+
+def parse_zai_usage(res):
+    """Parse Z.AI quota data and preserve shorter provider-wide blockers."""
+    limits = (res.get("data") or {}).get("limits") or []
+    windows = {}  # unit -> limit
+    for lim in limits:
+        if lim.get("type") in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
+            unit = finite_number(lim.get("unit"))
+            if unit is not None:
+                windows[int(unit)] = lim
+    main = windows.get(6) or windows.get(3)  # weekly, else 5h session
+    if not main:
+        raise ValueError("no usable zai quota window")
+    pct = _zai_remaining_pct(main)
+    if pct is None:
+        raise ValueError("zai quota window has no usage value")
+    lines = []
+    for unit, label in ((6, "Weekly"), (3, "5h session"), (7, "Monthly")):
+        lim = windows.get(unit)
+        if not lim:
+            continue
+        remaining_pct = _zai_remaining_pct(lim)
+        if remaining_pct is None:
+            continue
+        line = "{}: {}% left".format(label, round(remaining_pct))
+        reset = fmt_reset(lim.get("nextResetTime"))
+        if reset:
+            line += "  (resets {})".format(reset)
+        lines.append(line)
+    blockers = []
+    for unit, label in ((3, "5h session"), (6, "Weekly")):
+        lim = windows.get(unit)
+        if lim and _zai_limit_exhausted(lim):
+            blockers.append({
+                "label": label,
+                "resets_at": epoch_ms(lim.get("nextResetTime")),
+            })
+    level = (res.get("data") or {}).get("level")
+    if level:
+        lines.append("plan: " + level)
+    return {
+        "pct": pct,
+        "lines": lines,
+        "exhausted": bool(blockers),
+        "blockers": blockers,
+    }
 
 
 def fetch_zai():
@@ -405,29 +668,133 @@ def fetch_zai():
         headers={"Authorization": "Bearer " + token,
                  "Accept-Language": "en-US,en",
                  "Content-Type": "application/json"})
-    limits = (res.get("data") or {}).get("limits") or []
-    windows = {}  # unit -> limit
-    for lim in limits:
-        if lim.get("type") in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
-            windows[lim.get("unit")] = lim
-    main = windows.get(6) or windows.get(3)  # weekly, else 5h session
-    if not main:
-        raise ValueError("no usable zai quota window")
-    pct = 100.0 - max(0, min(100, main.get("percentage", 0)))
-    lines = []
-    for unit, label in ((6, "Weekly"), (3, "5h session"), (7, "Monthly")):
-        lim = windows.get(unit)
-        if not lim:
-            continue
-        line = "{}: {}% left".format(label, 100 - max(0, min(100, lim.get("percentage", 0))))
-        reset = fmt_reset(lim.get("nextResetTime"))
-        if reset:
-            line += "  (resets {})".format(reset)
-        lines.append(line)
-    level = (res.get("data") or {}).get("level")
-    if level:
-        lines.append("plan: " + level)
-    return {"pct": pct, "lines": lines}
+    return parse_zai_usage(res)
+
+
+def openrouter_management_key():
+    """Read the OpenRouter management key without putting it in the cache."""
+    for name in ("OPENROUTER_MANAGEMENT_API_KEY", "OPENROUTER_MANAGEMENT_KEY"):
+        raw_value = os.environ.get(name, "")
+        if raw_value:
+            value = raw_value.strip()
+            if not value or any(char.isspace() for char in value):
+                raise ValueError("OpenRouter management key is invalid")
+            return value
+
+    path = os.path.expanduser(os.environ.get(
+        "OPENROUTER_MANAGEMENT_KEY_FILE", OPENROUTER_KEY_PATH))
+    try:
+        info = os.stat(path)
+        if info.st_mode & 0o077:
+            raise PermissionError(
+                "OpenRouter key file must not be accessible by group or others")
+        with open(path) as key_file:
+            value = key_file.read().strip()
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "OpenRouter management key not configured; see README") from exc
+    if not value or any(char.isspace() for char in value):
+        raise ValueError("OpenRouter management key file is invalid")
+    return value
+
+
+def _openrouter_key_lines(key, now=None):
+    """Format one key without returning its hash or secret value."""
+    now = time.time() if now is None else now
+    name = key.get("name") or key.get("label") or "Unnamed key"
+    states = []
+    if key.get("disabled"):
+        states.append("disabled")
+    expires_at = epoch_ms(key.get("expires_at"))
+    if expires_at is not None and expires_at <= now * 1000.0:
+        states.append("expired")
+    limit_remaining = finite_number(key.get("limit_remaining"))
+    if limit_remaining is not None and limit_remaining <= 0:
+        states.append("limit used")
+    suffix = " [{}]".format(", ".join(states)) if states else ""
+
+    lines = [
+        "{}{}: {} total; {} today; {} week; {} month".format(
+            name, suffix, money(key.get("usage")),
+            money(key.get("usage_daily")), money(key.get("usage_weekly")),
+            money(key.get("usage_monthly")))
+    ]
+    limit = finite_number(key.get("limit"))
+    if limit is not None:
+        reset = key.get("limit_reset") or "no reset"
+        lines.append("  limit: {} of {} left ({})".format(
+            money(limit_remaining), money(limit), reset))
+    byok_usage = finite_number(key.get("byok_usage"))
+    if byok_usage is not None and byok_usage > 0:
+        lines.append("  BYOK: {} total; {} month".format(
+            money(byok_usage), money(key.get("byok_usage_monthly"))))
+    return lines
+
+
+def parse_openrouter_usage(credits_payload, keys, now=None):
+    """Build the OpenRouter account balance and per-key tooltip data."""
+    credits = credits_payload.get("data") or {}
+    total = finite_number(credits.get("total_credits"))
+    used = finite_number(credits.get("total_usage"))
+    if total is None or used is None:
+        raise ValueError("OpenRouter credits response has no totals")
+
+    balance = max(0.0, total - used)
+    # Credit totals are cumulative across top-ups. Their ratio is not a useful
+    # health gradient, so color a positive balance as usable and zero as empty.
+    pct = 100.0 if balance > 0 else 0.0
+    lines = [
+        "Credits: {} left; {} used; {} purchased".format(
+            money(balance), money(used), money(total)),
+        "API keys:",
+    ]
+    if keys:
+        for key in keys:
+            lines.extend(_openrouter_key_lines(key, now=now))
+    else:
+        lines.append("  none")
+
+    exhausted = balance <= 0
+    return {
+        "pct": pct,
+        "text": money(balance),
+        "summary": "{} credits left".format(money(balance)),
+        "exhausted_summary": "out of paid credits",
+        "lines": lines,
+        "exhausted": exhausted,
+        "blockers": ([{"label": "paid credits", "resets_at": None}]
+                     if exhausted else []),
+    }
+
+
+def fetch_openrouter():
+    """Fetch account credits and all default-workspace API key usage."""
+    token = openrouter_management_key()
+    headers = {
+        "Authorization": "Bearer " + token,
+        "User-Agent": "waybar-ai-usage",
+    }
+    credits = http_json(OPENROUTER_API + "/credits", headers=headers)
+    keys = []
+    offset = 0
+    for _ in range(100):
+        page = http_json(
+            OPENROUTER_API + "/keys?" + urllib.parse.urlencode({
+                "offset": offset,
+                "include_disabled": "true",
+            }),
+            headers=headers,
+        )
+        batch = page.get("data")
+        if not isinstance(batch, list):
+            raise ValueError("OpenRouter keys response has no key list")
+        keys.extend(batch)
+        if len(batch) < 100:
+            break
+        offset += len(batch)
+    else:
+        raise ValueError("OpenRouter returned too many API key pages")
+    return parse_openrouter_usage(credits, keys)
 
 
 # --------------------------------------------------------------------------
@@ -468,7 +835,8 @@ def refresh(old):
             else:
                 keep_old(key, "not reported by omp")
 
-    for key, fn in (("gemini", fetch_gemini), ("zai", fetch_zai)):
+    for key, fn in (("gemini", fetch_gemini), ("zai", fetch_zai),
+                    ("openrouter", fetch_openrouter)):
         try:
             providers[key] = {**fn(), "ts": now}
         except Exception as e:
@@ -480,6 +848,49 @@ def refresh(old):
         json.dump(state, f)
     os.replace(tmp, STATE_PATH)
     return state
+
+
+def active_blockers(data, now=None):
+    """Return blockers that have not reached their reset time."""
+    now_ms = (time.time() if now is None else now) * 1000.0
+
+    def active_in(items):
+        active = []
+        for blocker in items:
+            resets_at = finite_number(blocker.get("resets_at"))
+            if resets_at is None or resets_at > now_ms:
+                active.append(blocker)
+        return active
+
+    paths = data.get("blocker_paths")
+    if paths is not None:
+        active_paths = [active_in(path) for path in paths]
+        if not active_paths or not all(active_paths):
+            return []
+        return [blocker for path in active_paths for blocker in path]
+
+    blockers = data.get("blockers")
+    if blockers is None:
+        return ([{"label": "quota", "resets_at": None}]
+                if data.get("exhausted") else [])
+    return active_in(blockers)
+
+
+def state_needs_refresh(state, now=None):
+    """Refresh on the normal TTL or as soon as a blocked limit resets."""
+    now = time.time() if now is None else now
+    fetched_at = finite_number(state.get("fetched_at")) or 0
+    if now - fetched_at >= TTL:
+        return True
+    for data in state.get("providers", {}).values():
+        for blocker in data.get("blockers") or []:
+            resets_at = finite_number(blocker.get("resets_at"))
+            if resets_at is None:
+                continue
+            reset_seconds = resets_at / 1000.0
+            if fetched_at < reset_seconds <= now:
+                return True
+    return False
 
 
 def get_state():
@@ -496,7 +907,7 @@ def get_state():
             time.sleep(0.5)
     try:
         state = load_state()
-        if time.time() - state.get("fetched_at", 0) >= TTL:
+        if state_needs_refresh(state):
             state = refresh(state)
         return state
     finally:
@@ -507,30 +918,57 @@ def get_state():
 def emit(provider, state):
     name = NAMES[provider]
     data = state.get("providers", {}).get(provider)
-    if not data or "pct" not in data:
-        tooltip = "<b>{}</b>\nunavailable".format(name)
+    pct = finite_number(data.get("pct")) if data else None
+    if not data or pct is None:
+        tooltip = "<b>{}</b>\nunavailable".format(html.escape(name))
         if data and data.get("error"):
-            tooltip += ": " + data["error"]
+            tooltip += ": " + html.escape(str(data["error"]))
         print(json.dumps({
             "text": "<span foreground='{}'>--</span>".format(DIM),
             "tooltip": tooltip,
             "class": ["missing"],
         }))
         return
-    pct = data["pct"]
-    color = gradient(pct)
-    text = "<span foreground='{}'>{}%</span>".format(color, round(pct))
-    lines = ["<b>{}</b> — {}% of weekly left".format(name, round(pct))]
-    lines += data.get("lines", [])
+
+    blockers = active_blockers(data)
+    exhausted = bool(blockers)
+    color = (DIM if data.get("stale") else
+             (EXHAUSTED_COLOR if exhausted else gradient(pct)))
+    value = data.get("text", "{}%".format(round(pct)))
+    attrs = " weight='ultrabold'" if exhausted else ""
+    text = "<span foreground='{}'{}>{}</span>".format(
+        color, attrs, html.escape(str(value)))
+
+    if exhausted:
+        summary = data.get("exhausted_summary")
+        if not summary:
+            labels = []
+            for blocker in blockers:
+                label = str(blocker.get("label") or "quota")
+                if label not in labels:
+                    labels.append(label)
+            summary = "out of usage"
+            if labels:
+                summary += " ({})".format(", ".join(labels))
+    else:
+        summary = data.get(
+            "summary", "{}% of weekly left".format(round(pct)))
+    lines = ["<b>{}</b> — {}".format(
+        html.escape(name), html.escape(str(summary)))]
+    lines += [html.escape(str(line)) for line in data.get("lines", [])]
     if data.get("stale"):
         lines.append("(stale: {})".format(
             time.strftime("%H:%M", time.localtime(data.get("ts", 0)))))
-        text = "<span foreground='{}'>{}%</span>".format(DIM, round(pct))
     cls = "ok" if pct > 50 else ("warn" if pct > 20 else "crit")
+    classes = [cls]
+    if exhausted:
+        classes.append("exhausted")
+    if data.get("stale"):
+        classes.append("stale")
     print(json.dumps({
         "text": text,
         "tooltip": "\n".join(lines),
-        "class": [cls] + (["stale"] if data.get("stale") else []),
+        "class": classes,
         "percentage": round(pct),
     }))
 

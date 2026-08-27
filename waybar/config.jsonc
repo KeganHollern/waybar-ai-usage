@@ -11,7 +11,8 @@
             "custom/ai-claude",
             "custom/ai-grok",
             "custom/ai-gemini",
-            "custom/ai-zai"
+            "custom/ai-zai",
+            "custom/ai-openrouter"
         ]
     },
 
@@ -45,6 +46,13 @@
     },
     "custom/ai-zai": {
         "exec": "~/.config/waybar/scripts/ai-usage.py zai",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-openrouter": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py openrouter",
         "return-type": "json",
         "interval": 300,
         "signal": 8,

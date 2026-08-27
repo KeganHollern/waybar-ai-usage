@@ -1,8 +1,8 @@
 /* ===== AI usage island =====
  * Append to ~/.config/waybar/style.css.
  *
- * Brand SVG icons (theme-tinted) are drawn as backgrounds; the percent text
- * is colored by the script on a green->yellow->red gradient.
+ * Brand SVG icons (theme-tinted) are drawn as backgrounds; the value text is
+ * colored by the script on a green->yellow->red gradient.
  *
  * Icon url()s are relative to style.css, so the icons must live in
  * ~/.config/waybar/icons/ai/.
@@ -27,7 +27,8 @@
 #custom-ai-claude,
 #custom-ai-grok,
 #custom-ai-gemini,
-#custom-ai-zai {
+#custom-ai-zai,
+#custom-ai-openrouter {
     background-color: transparent;
     background-repeat: no-repeat;
     background-position: left center;
@@ -41,3 +42,16 @@
 #custom-ai-grok   { background-image: url("icons/ai/grok.svg"); }
 #custom-ai-gemini { background-image: url("icons/ai/gemini.svg"); }
 #custom-ai-zai    { background-image: url("icons/ai/zai.svg"); }
+#custom-ai-openrouter { background-image: url("icons/ai/openrouter.svg"); }
+
+/* A soft amber double strike marks an empty hard limit. */
+#custom-ai-codex.exhausted,
+#custom-ai-claude.exhausted,
+#custom-ai-grok.exhausted,
+#custom-ai-gemini.exhausted,
+#custom-ai-zai.exhausted,
+#custom-ai-openrouter.exhausted {
+    text-decoration-line: line-through;
+    text-decoration-style: double;
+    text-decoration-color: #ffcc66;
+}
