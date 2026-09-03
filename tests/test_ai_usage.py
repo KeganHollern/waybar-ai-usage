@@ -5,6 +5,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sqlite3
+import tempfile
+import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -361,6 +364,253 @@ class OpenRouterUsageTests(unittest.TestCase):
         self.assertIn("out of paid credits", output["tooltip"])
         self.assertEqual(output["class"], ["crit", "exhausted"])
         self.assertEqual(output["percentage"], 0)
+
+
+class MetaSubscriptionTests(unittest.TestCase):
+    def test_native_muse_auth_precedes_omp_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth_path = Path(tmp) / "auth.json"
+            auth_path.write_text(json.dumps({
+                "providers": {"meta": {"api_key": "native-muse-key"}},
+            }))
+            auth_path.chmod(0o600)
+            with mock.patch.dict(ai_usage.os.environ, {}, clear=True), \
+                    mock.patch.object(
+                        ai_usage, "MUSE_AUTH_PATH", str(auth_path)):
+                value = ai_usage.meta_api_key()
+
+        self.assertEqual(value, "native-muse-key")
+
+    def test_omp_fallback_uses_newest_active_meta_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / ".omp" / "agent" / "agent.db"
+            db_path.parent.mkdir(parents=True)
+            db = sqlite3.connect(db_path)
+            try:
+                db.execute(
+                    "CREATE TABLE auth_credentials ("
+                    "id INTEGER PRIMARY KEY, provider TEXT, data TEXT, "
+                    "disabled_cause TEXT, updated_at INTEGER)")
+                db.executemany(
+                    "INSERT INTO auth_credentials VALUES (?, 'meta', ?, ?, ?)",
+                    [
+                        (1, json.dumps({"key": "old-key"}), None, 10),
+                        (2, json.dumps({"key": "disabled-key"}), "old", 30),
+                        (3, json.dumps({"key": "new-key"}), None, 20),
+                    ])
+                db.commit()
+            finally:
+                db.close()
+            with mock.patch.dict(ai_usage.os.environ, {}, clear=True), \
+                    mock.patch.object(ai_usage, "HOME", tmp), \
+                    mock.patch.object(
+                        ai_usage, "MUSE_AUTH_PATH", str(Path(tmp) / "missing")):
+                value = ai_usage.meta_api_key()
+
+        self.assertEqual(value, "new-key")
+
+    def test_model_comes_from_native_muse_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(json.dumps({
+                "model": "muse-spark-test-contributor",
+            }))
+            with mock.patch.dict(ai_usage.os.environ, {}, clear=True), \
+                    mock.patch.object(
+                        ai_usage, "MUSE_SETTINGS_PATH", str(settings_path)):
+                value = ai_usage.meta_model()
+
+        self.assertEqual(value, "muse-spark-test-contributor")
+
+    def test_window_and_weekly_parse_with_plan(self):
+        now_ms = int(time.time() * 1000)
+        result = ai_usage.parse_meta_subscription({
+            "window": {
+                "used_percent": 27,
+                "resets_at": now_ms + 3600 * 1000,
+                "window_duration_mins": 300,
+            },
+            "weekly": {"used_percent": 40},
+            "plan": "Everyday Usage",
+        })
+
+        self.assertEqual(result["pct"], 60)
+        self.assertEqual(result["summary"], "60% left")
+        self.assertTrue(
+            result["lines"][0].startswith("5h prompts: 73% left"))
+        self.assertIn("  (resets ", result["lines"][0])
+        self.assertEqual(result["lines"][1], "Weekly: 60% left")
+        self.assertEqual(result["lines"][2], "plan: Everyday Usage")
+        self.assertFalse(result["exhausted"])
+        self.assertEqual(result["blockers"], [])
+
+    def test_numeric_plan_id_is_not_shown(self):
+        result = ai_usage.parse_meta_subscription({
+            "window": {"used_percent": 27},
+            "weekly": {"used_percent": 40},
+            "plan": "27681527378179523",
+        })
+
+        self.assertFalse(any(line.startswith("plan:")
+                             for line in result["lines"]))
+
+    def test_exhausted_window_sets_blocker(self):
+        now_ms = int(time.time() * 1000)
+        result = ai_usage.parse_meta_subscription({
+            "window": {
+                "used_percent": 100,
+                "resets_at": now_ms + 3600 * 1000,
+                "window_duration_mins": 300,
+            },
+            "weekly": {"used_percent": 10},
+        })
+
+        self.assertEqual(result["pct"], 0)
+        self.assertTrue(result["exhausted"])
+        self.assertEqual(result["blockers"], [
+            {"label": "5h prompts", "resets_at": float(now_ms + 3600 * 1000)},
+        ])
+
+    def test_bare_window_snapshot_has_no_weekly_line(self):
+        result = ai_usage.parse_meta_subscription({"used_percent": 10})
+
+        self.assertEqual(result["pct"], 90)
+        self.assertEqual(result["lines"], ["window prompts: 90% left"])
+        self.assertFalse(result["exhausted"])
+
+    def test_window_labels_follow_duration(self):
+        self.assertEqual(
+            ai_usage._meta_window_label({"window_duration_mins": 300}), "5h")
+        self.assertEqual(
+            ai_usage._meta_window_label({"window_duration_mins": 45}), "45m")
+        self.assertEqual(ai_usage._meta_window_label({}), "window")
+
+    def test_sse_takes_last_snapshot_and_skips_noise(self):
+        snapshot = ai_usage.meta_snapshot_from_sse([
+            '{"type": "response.created", "response": {"id": "r1"}}',
+            "not json",
+            json.dumps({"subscription": {
+                "window": {"used_percent": 50},
+            }}),
+            "[DONE]",
+            json.dumps({
+                "window": {"used_percent": 20, "window_duration_mins": 300},
+                "weekly": {"used_percent": 30},
+            }),
+        ])
+
+        self.assertEqual(snapshot["weekly"]["used_percent"], 30)
+
+    def test_sse_without_snapshot_raises(self):
+        with self.assertRaises(ValueError):
+            ai_usage.meta_snapshot_from_sse([
+                '{"type": "response.completed"}',
+                "[DONE]",
+            ])
+
+    def test_invalid_environment_key_does_not_leak(self):
+        secret = "secret-value with-space"
+        with mock.patch.dict(
+                ai_usage.os.environ,
+                {"META_API_KEY": secret}, clear=False):
+            with self.assertRaises(ValueError) as error:
+                ai_usage.meta_api_key()
+
+        self.assertNotIn("secret-value", str(error.exception))
+
+    def test_fetch_reuses_fresh_snapshot_without_http(self):
+        snapshot = {
+            "window": {
+                "used_percent": 25,
+                "resets_at": int(time.time() * 1000) + 7200 * 1000,
+                "window_duration_mins": 300,
+            },
+            "weekly": {"used_percent": 10},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "meta.json")
+            Path(path).write_text(json.dumps(
+                {"snapshot": snapshot, "ts": time.time()}))
+            with mock.patch.object(
+                    ai_usage, "META_SNAPSHOT_PATH", path), \
+                    mock.patch.object(
+                        ai_usage, "http_sse_data_lines",
+                        side_effect=AssertionError("must not fetch")), \
+                    mock.patch.object(
+                        ai_usage, "meta_api_key",
+                        side_effect=AssertionError("must not read key")):
+                result = ai_usage.fetch_meta()
+
+        self.assertEqual(result["pct"], 75)
+
+    def test_fetch_streams_and_caches_when_no_snapshot(self):
+        now_ms = int(time.time() * 1000) + 3600 * 1000
+        payload = {"window": {
+            "used_percent": 12,
+            "resets_at": now_ms,
+            "window_duration_mins": 300,
+            "account_id": "must-not-be-cached",
+        }, "plan": "27681527378179523"}
+        seen = {}
+
+        def fake_sse(url, headers=None, body=None, timeout=None):
+            seen["url"] = url
+            seen["headers"] = headers
+            seen["body"] = body
+            return [
+                '{"type": "response.created"}',
+                json.dumps({
+                    "type": "response.subscription_usage",
+                    "subscription": payload,
+                }),
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "meta.json")
+            with mock.patch.object(
+                    ai_usage, "META_SNAPSHOT_PATH", path), \
+                    mock.patch.object(
+                        ai_usage, "meta_api_key",
+                        return_value="unit-test-key"), \
+                    mock.patch.object(
+                        ai_usage, "http_sse_data_lines",
+                        side_effect=fake_sse):
+                result = ai_usage.fetch_meta()
+
+            saved = json.loads(Path(path).read_text())
+
+        self.assertEqual(result["pct"], 88)
+        self.assertEqual(seen["url"], "https://api.meta.ai/v1/responses")
+        self.assertEqual(
+            seen["headers"]["Authorization"], "Bearer unit-test-key")
+        self.assertTrue(seen["body"]["stream"])
+        self.assertEqual(seen["body"]["max_output_tokens"], 16)
+        self.assertEqual(saved["snapshot"], {"window": {
+            "used_percent": 12,
+            "resets_at": now_ms,
+            "window_duration_mins": 300,
+        }})
+        self.assertNotIn("unit-test-key", json.dumps(saved))
+        self.assertNotIn("must-not-be-cached", json.dumps(saved))
+        self.assertNotIn("27681527378179523", json.dumps(saved))
+
+    def test_emit_shows_muse_percentage(self):
+        output = emit_json("muse", {
+            "providers": {"muse": {
+                "pct": 60,
+                "summary": "60% left",
+                "lines": ["5h prompts: 60% left", "Weekly: 60% left"],
+                "exhausted": False,
+                "blockers": [],
+            }},
+        })
+
+        self.assertIn("60%", output["text"])
+        self.assertIn("Muse", output["tooltip"])
+        self.assertIn("60% left", output["tooltip"])
+        self.assertEqual(output["class"], ["ok"])
+        self.assertEqual(output["percentage"], 60)
 
 
 class BlockerAndOutputTests(unittest.TestCase):

@@ -28,7 +28,8 @@
 #custom-ai-grok,
 #custom-ai-gemini,
 #custom-ai-zai,
-#custom-ai-openrouter {
+#custom-ai-openrouter,
+#custom-ai-muse {
     background-color: transparent;
     background-repeat: no-repeat;
     background-position: left center;
@@ -43,6 +44,7 @@
 #custom-ai-gemini { background-image: url("icons/ai/gemini.svg"); }
 #custom-ai-zai    { background-image: url("icons/ai/zai.svg"); }
 #custom-ai-openrouter { background-image: url("icons/ai/openrouter.svg"); }
+#custom-ai-muse { background-image: url("icons/ai/muse.svg"); }
 
 /* A soft amber double strike marks an empty hard limit. */
 #custom-ai-codex.exhausted,
@@ -50,7 +52,8 @@
 #custom-ai-grok.exhausted,
 #custom-ai-gemini.exhausted,
 #custom-ai-zai.exhausted,
-#custom-ai-openrouter.exhausted {
+#custom-ai-openrouter.exhausted,
+#custom-ai-muse.exhausted {
     text-decoration-line: line-through;
     text-decoration-style: double;
     text-decoration-color: #ffcc66;

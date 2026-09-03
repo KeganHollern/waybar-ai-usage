@@ -12,7 +12,8 @@
             "custom/ai-grok",
             "custom/ai-gemini",
             "custom/ai-zai",
-            "custom/ai-openrouter"
+            "custom/ai-openrouter",
+            "custom/ai-muse"
         ]
     },
 
@@ -57,5 +58,12 @@
         "interval": 300,
         "signal": 8,
         "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json; pkill -RTMIN+8 waybar"
+    },
+    "custom/ai-muse": {
+        "exec": "~/.config/waybar/scripts/ai-usage.py muse",
+        "return-type": "json",
+        "interval": 300,
+        "signal": 8,
+        "on-click": "rm -f ~/.cache/waybar-ai-usage/state.json ~/.cache/waybar-ai-usage/meta-subscription.json; pkill -RTMIN+8 waybar"
     }
 }

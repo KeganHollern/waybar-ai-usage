@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Waybar AI subscription usage module.
 
-Usage: ai-usage.py <codex|claude|grok|gemini|zai|openrouter>
+Usage: ai-usage.py <codex|claude|grok|gemini|zai|openrouter|muse>
 
 Prints one Waybar custom-module JSON line for the given provider. Subscription
 modules show the weekly percentage. OpenRouter shows the USD credit balance.
@@ -14,6 +14,11 @@ Data sources:
                       (~/.gemini/oauth_creds.json) if agy is not signed in.
   zai               : api.z.ai quota API (token from omp's credential store)
   openrouter        : OpenRouter credits and API key management APIs
+  muse              : Meta Model API response stream (`POST /v1/responses`
+                      with `stream: true`). Reads the same subscription usage
+                      snapshot the `muse` `/usage` command shows. The snapshot
+                      is cached until its reset time, so one refresh pass
+                      costs at most one prompt per quota window.
 
 All module instances share one cache (~/.cache/waybar-ai-usage) guarded
 by a lock file, so a bar refresh performs a single fetch pass.
@@ -46,11 +51,17 @@ CONFIG_HOME = (XDG_CONFIG_HOME if os.path.isabs(XDG_CONFIG_HOME)
 OPENROUTER_KEY_PATH = os.path.join(
     CONFIG_HOME, "waybar-ai-usage", "openrouter-management-key")
 OPENROUTER_API = "https://openrouter.ai/api/v1"
+META_API = "https://api.meta.ai/v1"
+MUSE_AUTH_PATH = os.path.join(CONFIG_HOME, "muse", "auth.json")
+MUSE_SETTINGS_PATH = os.path.join(CONFIG_HOME, "muse", "settings.json")
+META_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "meta-subscription.json")
+META_MODEL = "muse-spark-1.3"
 
 TTL = 300  # seconds a fetched state stays fresh
 STALE_LIMIT = 3 * 3600  # drop carried-over data older than this
 
-PROVIDERS = ("codex", "claude", "grok", "gemini", "zai", "openrouter")
+PROVIDERS = ("codex", "claude", "grok", "gemini", "zai", "openrouter",
+             "muse")
 NAMES = {
     "codex": "OpenAI Codex",
     "claude": "Claude",
@@ -58,6 +69,7 @@ NAMES = {
     "gemini": "Gemini",
     "zai": "Z.AI",
     "openrouter": "OpenRouter",
+    "muse": "Muse",
 }
 
 # Theme colors (must match waybar style.css)
@@ -797,6 +809,280 @@ def fetch_openrouter():
     return parse_openrouter_usage(credits, keys)
 
 
+def meta_api_key():
+    """Read the Meta key without putting it in the cache or errors."""
+    raw_value = os.environ.get("META_API_KEY", "")
+    if raw_value.strip():
+        value = raw_value.strip()
+        if any(char.isspace() for char in value):
+            raise ValueError("Meta API key is invalid")
+        return value
+
+    auth_path = os.path.expanduser(
+        os.environ.get("MUSE_AUTH_PATH", MUSE_AUTH_PATH))
+    try:
+        info = os.stat(auth_path)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if info.st_mode & 0o077:
+            raise PermissionError(
+                "Muse auth file must not be accessible by group or others")
+        try:
+            with open(auth_path) as auth_file:
+                value = json.load(auth_file)["providers"]["meta"]["api_key"]
+            value = value.strip()
+        except (OSError, ValueError, KeyError, TypeError,
+                AttributeError) as exc:
+            raise ValueError("Muse auth file is invalid") from exc
+        if not value or any(char.isspace() for char in value):
+            raise ValueError("Muse API key is invalid")
+        return value
+
+    db = sqlite3.connect("file:" + os.path.join(HOME, ".omp", "agent", "agent.db")
+                         + "?mode=ro", uri=True)
+    try:
+        row = db.execute(
+            "SELECT data FROM auth_credentials "
+            "WHERE provider='meta' AND disabled_cause IS NULL "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
+    finally:
+        db.close()
+    if not row:
+        raise ValueError("no meta credential in omp store; run muse login")
+    try:
+        value = json.loads(row[0])["key"].strip()
+    except (ValueError, KeyError, AttributeError) as exc:
+        raise ValueError("meta credential in omp store is invalid") from exc
+    if not value or any(char.isspace() for char in value):
+        raise ValueError("meta credential in omp store is invalid")
+    return value
+
+
+def meta_model():
+    """Use the model from the environment or the native Muse settings."""
+    value = os.environ.get("META_MUSE_MODEL", "").strip()
+    if value:
+        return value
+    try:
+        with open(MUSE_SETTINGS_PATH) as settings_file:
+            value = json.load(settings_file).get("model", "").strip()
+    except (OSError, ValueError, AttributeError):
+        value = ""
+    return value or META_MODEL
+
+
+def http_sse_data_lines(url, headers, body, timeout=60, max_bytes=65536):
+    """POST JSON and return the SSE `data:` payload lines of the stream."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers)
+    lines = []
+    carried = b""
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode()[:200]
+        except ValueError:
+            detail = ""
+        try:
+            message = json.loads(detail).get("error", {}).get("message")
+        except ValueError:
+            message = None
+        raise ValueError("Meta API HTTP {}: {}".format(
+            exc.code, message or exc.reason)) from exc
+    with resp:
+        while len(carried) < max_bytes:
+            chunk = resp.read(min(16384, max_bytes - len(carried)))
+            if not chunk:
+                break
+            carried += chunk
+    for raw in carried.decode("utf-8", errors="replace").splitlines():
+        text = raw.strip()
+        if text.startswith("data:"):
+            lines.append(text[5:].strip())
+    return lines
+
+
+def _meta_used_percent(obj):
+    """Return a used percent (0-100), or None for missing values."""
+    used = finite_number(obj.get("used_percent"))
+    if used is None:
+        return None
+    return max(0.0, min(100.0, used))
+
+
+def _meta_window(snapshot, name):
+    """Return the named quota window, or the bare snapshot itself."""
+    window = snapshot.get(name)
+    if isinstance(window, dict) and _meta_used_percent(window) is not None:
+        return window
+    if name == "window" and _meta_used_percent(snapshot) is not None:
+        return snapshot
+    return None
+
+
+def _meta_window_label(window):
+    mins = finite_number(window.get("window_duration_mins"))
+    if mins:
+        if mins < 60:
+            return "{}m".format(int(mins))
+        hours = mins / 60.0
+        if hours == int(hours):
+            return "{}h".format(int(hours))
+        return "{:g}h".format(hours)
+    return "window"
+
+
+def meta_snapshot_from_sse(data_lines):
+    """Return the last subscription snapshot seen in SSE data lines."""
+    snapshot = None
+    for data in data_lines:
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        candidate = obj.get("subscription") if isinstance(
+            obj.get("subscription"), dict) else obj
+        if (_meta_window(candidate, "window") is not None
+                or _meta_window(candidate, "weekly") is not None):
+            snapshot = candidate
+    if snapshot is None:
+        raise ValueError("Meta stream carried no subscription usage")
+    return snapshot
+
+
+def parse_meta_subscription(snapshot):
+    """Turn a subscription snapshot into {pct, lines} like other parsers."""
+    windows = []
+    five_hour = _meta_window(snapshot, "window")
+    if five_hour is not None:
+        windows.append(("{} prompts".format(
+            _meta_window_label(five_hour)), five_hour))
+    weekly = _meta_window(snapshot, "weekly")
+    if weekly is not None:
+        windows.append(("Weekly", weekly))
+    if not windows:
+        raise ValueError("Meta subscription snapshot has no quota window")
+    lines = []
+    remaining = []
+    blockers = []
+    for label, window in windows:
+        used = _meta_used_percent(window)
+        pct_left = 100.0 - used
+        remaining.append(pct_left)
+        line = "{}: {}% left".format(label, round(pct_left))
+        reset = fmt_reset_value(window.get("resets_at"))
+        if reset:
+            line += "  (resets {})".format(reset)
+        lines.append(line)
+        if used >= 100:
+            blockers.append({
+                "label": label,
+                "resets_at": epoch_ms(window.get("resets_at")),
+            })
+    plan = snapshot.get("plan", snapshot.get("tier"))
+    if (isinstance(plan, str) and plan.strip()
+            and any(char.isalpha() for char in plan)):
+        lines.append("plan: " + plan.strip())
+    return {
+        "pct": min(remaining),
+        "summary": "{}% left".format(round(min(remaining))),
+        "lines": lines,
+        "exhausted": bool(blockers),
+        "blockers": blockers,
+    }
+
+
+def _meta_load_snapshot():
+    try:
+        with open(META_SNAPSHOT_PATH) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    if not isinstance(cached.get("snapshot"), dict):
+        return None
+    return cached
+
+
+def _meta_snapshot_fresh(cached, now):
+    """Reuse a snapshot while its resets lie ahead (or TTL without resets)."""
+    snapshot = cached["snapshot"]
+    resets = []
+    for name in ("window", "weekly"):
+        window = _meta_window(snapshot, name)
+        if window is not None:
+            resets.append(epoch_ms(window.get("resets_at")))
+    if any(reset is None for reset in resets):
+        ts = finite_number(cached.get("ts")) or 0
+        return now - ts < TTL
+    now_ms = now * 1000.0
+    return bool(resets) and all(reset > now_ms for reset in resets)
+
+
+def _meta_save_snapshot(snapshot, now):
+    """Cache display-safe usage fields only, never keys or account IDs."""
+    safe_snapshot = {}
+    for name in ("window", "weekly"):
+        window = snapshot.get(name)
+        if isinstance(window, dict):
+            safe_snapshot[name] = {
+                key: window[key]
+                for key in ("used_percent", "resets_at",
+                            "window_duration_mins")
+                if key in window
+            }
+    if not safe_snapshot and _meta_used_percent(snapshot) is not None:
+        safe_snapshot = {
+            key: snapshot[key]
+            for key in ("used_percent", "resets_at", "window_duration_mins")
+            if key in snapshot
+        }
+    plan = snapshot.get("plan", snapshot.get("tier"))
+    if (isinstance(plan, str) and plan.strip()
+            and any(char.isalpha() for char in plan)):
+        safe_snapshot["plan"] = plan.strip()
+    tmp = META_SNAPSHOT_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"snapshot": safe_snapshot, "ts": now}, f)
+    os.replace(tmp, META_SNAPSHOT_PATH)
+
+
+def fetch_meta():
+    """Read the /usage-style snapshot from one streamed response.
+
+    The snapshot is reused until its reset time, so a refresh pass costs
+    at most one prompt per quota window instead of one per poll.
+    """
+    now = time.time()
+    cached = _meta_load_snapshot()
+    if cached is not None and _meta_snapshot_fresh(cached, now):
+        try:
+            return parse_meta_subscription(cached["snapshot"])
+        except ValueError:
+            pass
+    key = meta_api_key()
+    model = meta_model()
+    lines = http_sse_data_lines(
+        META_API + "/responses",
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json",
+                 "Accept": "text/event-stream",
+                 "User-Agent": "waybar-ai-usage"},
+        body={"model": model, "input": "ping", "stream": True,
+              "max_output_tokens": 16},
+        timeout=60)
+    snapshot = meta_snapshot_from_sse(lines)
+    _meta_save_snapshot(snapshot, now)
+    return parse_meta_subscription(snapshot)
+
+
 # --------------------------------------------------------------------------
 # Cache orchestration
 # --------------------------------------------------------------------------
@@ -836,7 +1122,8 @@ def refresh(old):
                 keep_old(key, "not reported by omp")
 
     for key, fn in (("gemini", fetch_gemini), ("zai", fetch_zai),
-                    ("openrouter", fetch_openrouter)):
+                    ("openrouter", fetch_openrouter),
+                    ("muse", fetch_meta)):
         try:
             providers[key] = {**fn(), "ts": now}
         except Exception as e:

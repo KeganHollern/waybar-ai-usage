@@ -6,9 +6,10 @@ provider has one module. Quota values use a green → yellow → red gradient.
 ![AI usage island](screenshots/island.png)
 
 The screenshot shows OpenAI Codex, Claude, Grok, Gemini, and Z.AI. The new
-OpenRouter module appears after Z.AI. Hovering a module shows each reported
-limit and its reset time. The OpenRouter tooltip shows the account credit
-total and usage for each API key. Left-click forces a refresh.
+OpenRouter module appears after Z.AI, and the Muse module appears after
+OpenRouter. Hovering a module shows each reported limit and its reset time.
+The OpenRouter tooltip shows the account credit total and usage for each API
+key. Left-click forces a refresh.
 
 If a hard limit is empty, the value has a soft amber double line.
 For example, Z.AI can show a marked `80%` when the weekly pool has 80% left
@@ -33,6 +34,7 @@ If an empty limit resets before 5 minutes, the script refreshes at that reset.
 | `gemini` | `agy -p /usage --output-format json` — [Antigravity CLI](https://antigravity.google/docs/cli/getting-started) (`agy`). Falls back to the old `cloudcode-pa` quota API via `gemini-cli` OAuth (`~/.gemini/oauth_creds.json`) if `agy` is not signed in |
 | `zai` | `api.z.ai` quota API, token read from omp's credential store (`~/.omp/agent/agent.db`) |
 | `openrouter` | OpenRouter [`/credits`](https://openrouter.ai/docs/api/api-reference/credits/get-credits) and [`/keys`](https://openrouter.ai/docs/api/api-reference/api-keys/list) management APIs |
+| `muse` | Meta Model API response stream (`POST https://api.meta.ai/v1/responses` with `stream: true`) — the same subscription usage snapshot the `muse` `/usage` command shows |
 
 Each fetcher is a small self-contained function; if you don't use one of
 these tools, adapting a fetcher to your own token source is a ~40-line job.
@@ -46,6 +48,7 @@ these tools, adapting a fetcher to your own token source is a ~40-line job.
   - **gemini** — `agy` (Antigravity CLI), signed in via Google; or `gemini-cli` as a fallback
   - **zai** — a Z.AI credential in omp's store
   - **openrouter** — an OpenRouter management API key
+  - **muse** — `muse login`, or `META_API_KEY` in the Waybar environment
 
 ## Install
 
@@ -101,6 +104,32 @@ balance is amber and has a double line through it. The tooltip shows total,
 daily, weekly, and monthly usage for each key in the default workspace. Disabled,
 expired, and limit-used keys have a state label.
 
+### Muse setup
+
+The Muse module reads the subscription snapshot from one minimal streamed
+response (`ping`, max 16 output tokens). It uses the same event the `muse`
+`/usage` command shows: 5-hour prompt use, weekly use, and reset times.
+
+Key lookup order:
+
+1. `META_API_KEY` in the Waybar environment.
+2. The native Muse login file (`~/.config/muse/auth.json`), written by
+   `muse login`. Set `MUSE_AUTH_PATH` if you use a different path.
+3. The newest active `meta` credential in omp's store
+   (`~/.omp/agent/agent.db`) as a fallback. The script opens both stores
+   read-only.
+
+Cost control: the snapshot is cached in
+`~/.cache/waybar-ai-usage/meta-subscription.json` (usage data only, never
+keys or account IDs) and reused until its reset time. A refresh pass costs at
+most one prompt per quota window, not one per poll. A left-click removes this
+snapshot and gets a new value. Set `META_MUSE_MODEL` to change the model used
+for the probe. By default, the script uses the model in the Muse settings and
+then falls back to `muse-spark-1.3`.
+
+If the module shows `401 invalid_api_key`, run `muse login` again and force a
+refresh with a left-click.
+
 ### Dropping providers
 
 Each provider is an independent module: to skip one, remove its
@@ -132,6 +161,8 @@ quietly into the shared cache, so removing the module is all that's needed.
   own access token; it never writes to gemini-cli's files.
 - The script runs read-only against provider APIs and local credential
   stores; the only state it writes lives in `~/.cache/waybar-ai-usage/`.
+  The Muse probe is the one exception: one minimal streamed response per
+  quota window (see Muse setup).
 - A zero OpenRouter credit balance means that paid requests are out of credit.
   OpenRouter free models can still have separate request limits.
 - Provider logos are trademarks of their respective owners, used here solely
