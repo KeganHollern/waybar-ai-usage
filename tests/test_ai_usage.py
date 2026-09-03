@@ -11,6 +11,7 @@ import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
+import xml.etree.ElementTree as ET
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "ai-usage.py"
@@ -283,8 +284,15 @@ class OpenRouterUsageTests(unittest.TestCase):
         ])
         self.assertTrue(any(line.startswith("key-0:")
                             for line in result["lines"]))
-        self.assertTrue(any(line.startswith("key-100:")
-                            for line in result["lines"]))
+        self.assertFalse(any(line.startswith("key-100:")
+                             for line in result["lines"]))
+        self.assertEqual(len(result["openrouter"]["keys"]), 10)
+        self.assertEqual(result["openrouter"]["hidden_key_count"], 91)
+        self.assertIn("91 more keys are not shown", result["lines"])
+        output = emit_json("openrouter", {
+            "providers": {"openrouter": result},
+        })
+        self.assertIn("91 more keys are not shown", output["tooltip"])
         self.assertNotIn(test_key, json.dumps(result))
 
     def test_balance_and_key_lines_are_formatted(self):
@@ -319,7 +327,7 @@ class OpenRouterUsageTests(unittest.TestCase):
             "  limit: $0.00 of $10.00 left (monthly <cycle>)",
             "  BYOK: $0.20 total; $0.10 month",
         ])
-        self.assertNotIn("must-not-appear", "\n".join(result["lines"]))
+        self.assertNotIn("must-not-appear", json.dumps(result))
         self.assertFalse(result["exhausted"])
 
     def test_emit_escapes_openrouter_key_text(self):
@@ -344,6 +352,9 @@ class OpenRouterUsageTests(unittest.TestCase):
         self.assertIn("R&amp;D &lt;prod&gt;", output["tooltip"])
         self.assertIn("monthly &lt;cycle&gt;", output["tooltip"])
         self.assertNotIn("R&D <prod>", output["tooltip"])
+        self.assertIn(">ACCOUNT</span>", output["tooltip"])
+        self.assertIn(">API KEYS</span>", output["tooltip"])
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
         self.assertEqual(output["class"], ["ok"])
         self.assertEqual(output["percentage"], 100)
 
@@ -361,9 +372,30 @@ class OpenRouterUsageTests(unittest.TestCase):
         self.assertNotIn("\N{COMBINING LONG STROKE OVERLAY}", output["text"])
         self.assertIn("weight='ultrabold'", output["text"])
         self.assertIn("foreground='#ffcc66'", output["text"])
-        self.assertIn("out of paid credits", output["tooltip"])
+        self.assertIn("Out of paid credits", output["tooltip"])
         self.assertEqual(output["class"], ["crit", "exhausted"])
         self.assertEqual(output["percentage"], 0)
+
+    def test_old_cache_tooltip_handles_colons_and_control_characters(self):
+        data = {
+            "pct": 100,
+            "text": "$1.00",
+            "summary": "$1.00 credits left",
+            "lines": [
+                "Model: R&D\x00: 50% left  (resets 03:07)",
+                "note: first line\nfalse section",
+            ],
+        }
+
+        output = emit_json("openrouter", {
+            "providers": {"openrouter": data},
+        })
+
+        self.assertIn(">Model: R&amp;D </span>", output["tooltip"])
+        self.assertIn("Resets 03:07", output["tooltip"])
+        self.assertIn("first line false section", output["tooltip"])
+        self.assertNotIn("\x00", output["tooltip"])
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
 
 
 class MetaSubscriptionTests(unittest.TestCase):
@@ -607,8 +639,8 @@ class MetaSubscriptionTests(unittest.TestCase):
         })
 
         self.assertIn("60%", output["text"])
-        self.assertIn("Muse", output["tooltip"])
-        self.assertIn("60% left", output["tooltip"])
+        self.assertIn(">USAGE</span>", output["tooltip"])
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
         self.assertEqual(output["class"], ["ok"])
         self.assertEqual(output["percentage"], 60)
 
@@ -690,7 +722,11 @@ class BlockerAndOutputTests(unittest.TestCase):
         self.assertIn("80%", output["text"])
         self.assertIn("weight='ultrabold'", output["text"])
         self.assertIn("foreground='#ffcc66'", output["text"])
-        self.assertIn("out of usage (5h session)", output["tooltip"])
+        self.assertIn("Out of usage: 5h session", output["tooltip"])
+        self.assertIn(">USAGE</span>", output["tooltip"])
+        self.assertTrue(output["tooltip"].startswith(
+            "<span size='small' weight='normal'>"))
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
         self.assertEqual(output["class"], ["ok", "exhausted"])
         self.assertEqual(output["percentage"], 80)
 
@@ -713,8 +749,34 @@ class BlockerAndOutputTests(unittest.TestCase):
         self.assertEqual(output["class"], ["ok"])
         self.assertEqual(output["percentage"], 80)
 
+    def test_missing_tooltip_escapes_the_error(self):
+        output = emit_json("codex", {
+            "providers": {"codex": {"error": "bad <token> & value"}},
+        })
+
+        self.assertIn("Usage data is not available", output["tooltip"])
+        self.assertIn("bad &lt;token&gt; &amp; value", output["tooltip"])
+        self.assertNotIn("bad <token>", output["tooltip"])
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
+        self.assertEqual(output["class"], ["missing"])
+
 
 class WaybarStyleTests(unittest.TestCase):
+    def test_tooltip_style_matches_the_desktop_popup_theme(self):
+        css = (SCRIPT_PATH.parent / "waybar" / "style.css").read_text()
+        tooltip_rule = css[css.index("tooltip {"):]
+        tooltip_rule = tooltip_rule[:tooltip_rule.index("}")]
+        label_rule = css[css.index("tooltip label {"):]
+        label_rule = label_rule[:label_rule.index("}")]
+
+        self.assertIn("rgba(17, 17, 27, 0.96)", tooltip_rule)
+        self.assertIn("1px solid rgba(51, 204, 255, 0.38)", tooltip_rule)
+        self.assertIn("border-radius: 12px", tooltip_rule)
+        self.assertIn("box-shadow: 0 12px 30px", tooltip_rule)
+        self.assertNotIn("font-size", label_rule)
+        self.assertNotIn("font-weight", label_rule)
+        self.assertIn("padding: 10px 12px", label_rule)
+
     def test_exhausted_style_uses_a_double_amber_strike_without_background(self):
         css = (SCRIPT_PATH.parent / "waybar" / "style.css").read_text()
         exhausted_rule = css[css.index("#custom-ai-codex.exhausted"):]

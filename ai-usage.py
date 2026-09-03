@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,6 +52,7 @@ CONFIG_HOME = (XDG_CONFIG_HOME if os.path.isabs(XDG_CONFIG_HOME)
 OPENROUTER_KEY_PATH = os.path.join(
     CONFIG_HOME, "waybar-ai-usage", "openrouter-management-key")
 OPENROUTER_API = "https://openrouter.ai/api/v1"
+OPENROUTER_TOOLTIP_KEY_LIMIT = 10
 META_API = "https://api.meta.ai/v1"
 MUSE_AUTH_PATH = os.path.join(CONFIG_HOME, "muse", "auth.json")
 MUSE_SETTINGS_PATH = os.path.join(CONFIG_HOME, "muse", "settings.json")
@@ -61,7 +63,7 @@ TTL = 300  # seconds a fetched state stays fresh
 STALE_LIMIT = 3 * 3600  # drop carried-over data older than this
 
 PROVIDERS = ("codex", "claude", "grok", "gemini", "zai", "openrouter",
-             "muse")
+               "muse")
 NAMES = {
     "codex": "OpenAI Codex",
     "claude": "Claude",
@@ -78,6 +80,11 @@ YELLOW = (0xFF, 0xEE, 0x66)
 RED = (0xFF, 0x66, 0x66)     # @alert-color
 DIM = "#66667a"
 EXHAUSTED_COLOR = "#ffcc66"
+TOOLTIP_PRIMARY = "#33ccff"
+TOOLTIP_SECONDARY = "#00ff99"
+TOOLTIP_TEXT = "#ffffff"
+TOOLTIP_MUTED = "#8a8aa0"
+TOOLTIP_ALERT = "#ff6666"
 
 # gemini-cli's installed-app OAuth client, shipped in plaintext in the CLI's
 # own public source (see README). Per Google's OAuth docs, installed-app
@@ -710,8 +717,8 @@ def openrouter_management_key():
     return value
 
 
-def _openrouter_key_lines(key, now=None):
-    """Format one key without returning its hash or secret value."""
+def _openrouter_key_data(key, now=None):
+    """Keep display-safe OpenRouter key data without its hash or secret."""
     now = time.time() if now is None else now
     name = key.get("name") or key.get("label") or "Unnamed key"
     states = []
@@ -723,24 +730,56 @@ def _openrouter_key_lines(key, now=None):
     limit_remaining = finite_number(key.get("limit_remaining"))
     if limit_remaining is not None and limit_remaining <= 0:
         states.append("limit used")
-    suffix = " [{}]".format(", ".join(states)) if states else ""
+
+    data = {
+        "name": str(name),
+        "states": states,
+        "total": money(key.get("usage")),
+        "today": money(key.get("usage_daily")),
+        "week": money(key.get("usage_weekly")),
+        "month": money(key.get("usage_monthly")),
+    }
+    limit = finite_number(key.get("limit"))
+    if limit is not None:
+        data["limit"] = {
+            "remaining": money(limit_remaining),
+            "total": money(limit),
+            "reset": str(key.get("limit_reset") or "no reset"),
+        }
+    byok_usage = finite_number(key.get("byok_usage"))
+    if byok_usage is not None and byok_usage > 0:
+        data["byok"] = {
+            "total": money(byok_usage),
+            "month": money(key.get("byok_usage_monthly")),
+        }
+    return data
+
+
+def _openrouter_key_lines_from_data(data):
+    """Format display-safe key data as backward-compatible plain lines."""
+    suffix = (" [{}]".format(", ".join(data["states"]))
+              if data["states"] else "")
 
     lines = [
         "{}{}: {} total; {} today; {} week; {} month".format(
-            name, suffix, money(key.get("usage")),
-            money(key.get("usage_daily")), money(key.get("usage_weekly")),
-            money(key.get("usage_monthly")))
+            data["name"], suffix, data["total"], data["today"],
+            data["week"], data["month"])
     ]
-    limit = finite_number(key.get("limit"))
-    if limit is not None:
-        reset = key.get("limit_reset") or "no reset"
+    if data.get("limit"):
+        limit = data["limit"]
         lines.append("  limit: {} of {} left ({})".format(
-            money(limit_remaining), money(limit), reset))
-    byok_usage = finite_number(key.get("byok_usage"))
-    if byok_usage is not None and byok_usage > 0:
+            limit["remaining"], limit["total"], limit["reset"]))
+    if data.get("byok"):
+        byok = data["byok"]
         lines.append("  BYOK: {} total; {} month".format(
-            money(byok_usage), money(key.get("byok_usage_monthly"))))
+            byok["total"], byok["month"]))
     return lines
+
+
+def _openrouter_key_lines(key, now=None):
+    """Format one key without returning its hash or secret value."""
+    return _openrouter_key_lines_from_data(
+        _openrouter_key_data(key, now=now))
 
 
 def parse_openrouter_usage(credits_payload, keys, now=None):
@@ -752,6 +791,10 @@ def parse_openrouter_usage(credits_payload, keys, now=None):
         raise ValueError("OpenRouter credits response has no totals")
 
     balance = max(0.0, total - used)
+    now = time.time() if now is None else now
+    shown_keys = keys[:OPENROUTER_TOOLTIP_KEY_LIMIT]
+    key_data = [_openrouter_key_data(key, now=now) for key in shown_keys]
+    hidden_key_count = max(0, len(keys) - len(shown_keys))
     # Credit totals are cumulative across top-ups. Their ratio is not a useful
     # health gradient, so color a positive balance as usable and zero as empty.
     pct = 100.0 if balance > 0 else 0.0
@@ -760,9 +803,11 @@ def parse_openrouter_usage(credits_payload, keys, now=None):
             money(balance), money(used), money(total)),
         "API keys:",
     ]
-    if keys:
-        for key in keys:
-            lines.extend(_openrouter_key_lines(key, now=now))
+    if key_data:
+        for key in key_data:
+            lines.extend(_openrouter_key_lines_from_data(key))
+        if hidden_key_count:
+            lines.append("{} more keys are not shown".format(hidden_key_count))
     else:
         lines.append("  none")
 
@@ -773,6 +818,13 @@ def parse_openrouter_usage(credits_payload, keys, now=None):
         "summary": "{} credits left".format(money(balance)),
         "exhausted_summary": "out of paid credits",
         "lines": lines,
+        "openrouter": {
+            "balance": money(balance),
+            "used": money(used),
+            "purchased": money(total),
+            "keys": key_data,
+            "hidden_key_count": hidden_key_count,
+        },
         "exhausted": exhausted,
         "blockers": ([{"label": "paid credits", "resets_at": None}]
                      if exhausted else []),
@@ -1202,14 +1254,209 @@ def get_state():
         lock.close()
 
 
+def _tooltip_escape(value):
+    """Escape API text and replace controls that can break tooltip markup."""
+    text = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in str(value)
+    )
+    return html.escape(text)
+
+
+def _tooltip_title(value):
+    return "<span size='large' weight='bold' foreground='{}'>{}</span>".format(
+        TOOLTIP_PRIMARY, _tooltip_escape(value))
+
+
+def _tooltip_section(value):
+    return "<span size='small' weight='bold' foreground='{}'>{}</span>".format(
+        TOOLTIP_PRIMARY, _tooltip_escape(str(value).upper()))
+
+
+def _tooltip_status(summary, color):
+    text = str(summary)
+    if text.startswith("out of usage (") and text.endswith(")"):
+        text = "Out of usage: " + text[len("out of usage ("):-1]
+    elif text:
+        text = text[:1].upper() + text[1:]
+    escaped = _tooltip_escape(text)
+    return ("<span foreground='{0}'>●</span>  "
+            "<span weight='bold' foreground='{0}'>{1}</span>").format(
+                color, escaped)
+
+
+def _tooltip_detail_markup(line):
+    """Turn one plain cached detail line into safe Pango markup."""
+    text = str(line).strip()
+    if not text:
+        return []
+    if text.endswith(":"):
+        return ["", _tooltip_section(text[:-1])]
+
+    reset = None
+    reset_marker = "  (resets "
+    if reset_marker in text and text.endswith(")"):
+        text, reset = text.rsplit(reset_marker, 1)
+        reset = reset[:-1]
+
+    label, separator, value = text.rpartition(": ")
+    if not separator:
+        return ["<span foreground='{}'>{}</span>".format(
+            TOOLTIP_MUTED, _tooltip_escape(text))]
+
+    clean_label = label.strip()
+    if clean_label.casefold() == "plan":
+        clean_label = "Plan"
+    markup = ("<span weight='bold' foreground='{0}'>{1}</span>  "
+              "<span foreground='{0}'>{2}</span>").format(
+                  TOOLTIP_TEXT, _tooltip_escape(clean_label),
+                  _tooltip_escape(value.strip()))
+    if reset:
+        markup += ("  <span size='small' foreground='{}'>Resets {}</span>"
+                   .format(TOOLTIP_MUTED, _tooltip_escape(reset)))
+    return [markup]
+
+
+def _append_tooltip_markup(target, items):
+    for item in items:
+        if item or (target and target[-1]):
+            target.append(item)
+
+
+def _tooltip_document(lines):
+    """Set AI tooltip body text without changing other Waybar tooltips."""
+    return "<span size='small' weight='normal'>{}</span>".format(
+        "\n".join(lines))
+
+
+def _generic_tooltip(name, summary, data, status_color):
+    lines = [_tooltip_title(name), _tooltip_status(summary, status_color)]
+    details = data.get("lines") or []
+    first = str(details[0]).strip() if details else ""
+    if details:
+        lines.append("")
+        if not first.endswith(":"):
+            lines.append(_tooltip_section("Usage"))
+        for detail in details:
+            _append_tooltip_markup(lines, _tooltip_detail_markup(detail))
+    if data.get("stale"):
+        lines.extend([
+            "",
+            "<span size='small' foreground='{}'>Cached data from {}</span>".format(
+                TOOLTIP_MUTED,
+                time.strftime("%H:%M", time.localtime(data.get("ts", 0))),
+            ),
+        ])
+    return _tooltip_document(lines)
+
+
+def _openrouter_tooltip(name, summary, data, status_color):
+    details = data.get("openrouter")
+    if not isinstance(details, dict):
+        return _generic_tooltip(name, summary, data, status_color)
+
+    lines = [
+        _tooltip_title(name),
+        _tooltip_status(summary, status_color),
+        "",
+        _tooltip_section("Account"),
+        ("<span size='small' foreground='{0}'>{1} used  •  "
+         "{2} purchased</span>").format(
+             TOOLTIP_MUTED, _tooltip_escape(details.get("used", "$--")),
+             _tooltip_escape(details.get("purchased", "$--"))),
+        "",
+        _tooltip_section("API keys"),
+    ]
+
+    keys = details.get("keys") or []
+    if not keys:
+        lines.append("<span foreground='{}'>No API keys</span>".format(
+            TOOLTIP_MUTED))
+    for index, key in enumerate(keys):
+        if index:
+            lines.append("")
+        key_header = "<span weight='bold' foreground='{}'>{}</span>".format(
+            TOOLTIP_TEXT, _tooltip_escape(key.get("name") or "Unnamed key"))
+        states = key.get("states") or []
+        if states:
+            key_header += ("  <span size='small' weight='bold' "
+                           "foreground='{}'>{}</span>").format(
+                               EXHAUSTED_COLOR,
+                               _tooltip_escape(" · ".join(
+                                   str(state).upper() for state in states)))
+        lines.extend([
+            key_header,
+            ("<span weight='bold' foreground='{0}'>{1}</span>  "
+             "<span foreground='{2}'>total</span>").format(
+                 TOOLTIP_TEXT, _tooltip_escape(key.get("total", "$--")),
+                 TOOLTIP_MUTED),
+            ("<span size='small' foreground='{0}'>Today {1}  •  "
+             "Week {2}  •  Month {3}</span>").format(
+                 TOOLTIP_MUTED, _tooltip_escape(key.get("today", "$--")),
+                 _tooltip_escape(key.get("week", "$--")),
+                 _tooltip_escape(key.get("month", "$--"))),
+        ])
+        limit = key.get("limit")
+        if isinstance(limit, dict):
+            lines.append(
+                ("<span size='small' foreground='{0}'>Limit {1} of {2} left  "
+                 "•  {3}</span>").format(
+                     TOOLTIP_MUTED,
+                     _tooltip_escape(limit.get("remaining", "$--")),
+                     _tooltip_escape(limit.get("total", "$--")),
+                     _tooltip_escape(limit.get("reset", "no reset")),
+                ))
+        byok = key.get("byok")
+        if isinstance(byok, dict):
+            lines.append(
+                ("<span size='small' foreground='{0}'>BYOK {1} total  •  "
+                 "{2} month</span>").format(
+                     TOOLTIP_MUTED,
+                     _tooltip_escape(byok.get("total", "$--")),
+                     _tooltip_escape(byok.get("month", "$--")),
+                ))
+
+    hidden_key_count = int(finite_number(
+        details.get("hidden_key_count")) or 0)
+    if hidden_key_count > 0:
+        lines.extend([
+            "",
+            "<span size='small' foreground='{}'>{} more keys are not shown</span>"
+            .format(TOOLTIP_MUTED, hidden_key_count),
+        ])
+
+    if data.get("stale"):
+        lines.extend([
+            "",
+            "<span size='small' foreground='{}'>Cached data from {}</span>".format(
+                TOOLTIP_MUTED,
+                time.strftime("%H:%M", time.localtime(data.get("ts", 0))),
+            ),
+        ])
+    return _tooltip_document(lines)
+
+
+def _missing_tooltip(name, error=None):
+    lines = [
+        _tooltip_title(name),
+        _tooltip_status("Usage data is not available", TOOLTIP_ALERT),
+    ]
+    if error:
+        lines.extend([
+            "",
+            "<span size='small' foreground='{}'>{}</span>".format(
+                TOOLTIP_MUTED, _tooltip_escape(error)),
+        ])
+    return _tooltip_document(lines)
+
+
 def emit(provider, state):
     name = NAMES[provider]
     data = state.get("providers", {}).get(provider)
     pct = finite_number(data.get("pct")) if data else None
     if not data or pct is None:
-        tooltip = "<b>{}</b>\nunavailable".format(html.escape(name))
-        if data and data.get("error"):
-            tooltip += ": " + html.escape(str(data["error"]))
+        tooltip = _missing_tooltip(
+            name, data.get("error") if data else None)
         print(json.dumps({
             "text": "<span foreground='{}'>--</span>".format(DIM),
             "tooltip": tooltip,
@@ -1240,12 +1487,10 @@ def emit(provider, state):
     else:
         summary = data.get(
             "summary", "{}% of weekly left".format(round(pct)))
-    lines = ["<b>{}</b> — {}".format(
-        html.escape(name), html.escape(str(summary)))]
-    lines += [html.escape(str(line)) for line in data.get("lines", [])]
-    if data.get("stale"):
-        lines.append("(stale: {})".format(
-            time.strftime("%H:%M", time.localtime(data.get("ts", 0)))))
+    if provider == "openrouter":
+        tooltip = _openrouter_tooltip(name, summary, data, color)
+    else:
+        tooltip = _generic_tooltip(name, summary, data, color)
     cls = "ok" if pct > 50 else ("warn" if pct > 20 else "crit")
     classes = [cls]
     if exhausted:
@@ -1254,7 +1499,7 @@ def emit(provider, state):
         classes.append("stale")
     print(json.dumps({
         "text": text,
-        "tooltip": "\n".join(lines),
+        "tooltip": tooltip,
         "class": classes,
         "percentage": round(pct),
     }))

@@ -7,9 +7,9 @@ provider has one module. Quota values use a green → yellow → red gradient.
 
 The screenshot shows OpenAI Codex, Claude, Grok, Gemini, and Z.AI. The new
 OpenRouter module appears after Z.AI, and the Muse module appears after
-OpenRouter. Hovering a module shows each reported limit and its reset time.
-The OpenRouter tooltip shows the account credit total and usage for each API
-key. Left-click forces a refresh.
+OpenRouter. Hovering a module shows a formatted
+summary, each reported limit, and its reset time. The OpenRouter tooltip shows
+the account credit total and usage for each API key. Left-click forces a refresh.
 
 If a hard limit is empty, the value has a soft amber double line.
 For example, Z.AI can show a marked `80%` when the weekly pool has 80% left
@@ -48,7 +48,7 @@ these tools, adapting a fetcher to your own token source is a ~40-line job.
   - **gemini** — `agy` (Antigravity CLI), signed in via Google; or `gemini-cli` as a fallback
   - **zai** — a Z.AI credential in omp's store
   - **openrouter** — an OpenRouter management API key
-  - **muse** — `muse login`, or `META_API_KEY` in the Waybar environment
+  - **muse** — `muse login` (key read from omp's store), or `META_API_KEY` in the Waybar environment
 
 ## Install
 
@@ -127,8 +127,9 @@ snapshot and gets a new value. Set `META_MUSE_MODEL` to change the model used
 for the probe. By default, the script uses the model in the Muse settings and
 then falls back to `muse-spark-1.3`.
 
-If the module shows `401 invalid_api_key`, run `muse login` again and force a
-refresh with a left-click.
+If the module shows `401 invalid_api_key`, the stored login key is stale:
+re-run `muse login` (or any omp Meta request, which refreshes it) and force
+a refresh with a left-click.
 
 ### Dropping providers
 
@@ -146,6 +147,9 @@ quietly into the shared cache, so removing the module is all that's needed.
   `#33ccff`) — edit the hex in `icons/*.svg` to match your theme.
 - **Island**: the `#ai` block in `waybar/style.css` uses a gradient-border
   trick; replace it with your own group styling if you have one.
+- **Tooltip**: the `tooltip` blocks change the surface, padding, and base text
+  color for all Waybar tooltips. They match the desktop popups. The script adds
+  section and value styles only to the AI usage tooltips.
 - The script also emits `class` (`ok` / `warn` / `crit` / `exhausted` /
   `stale` / `missing`) and `percentage`, so you can style states in CSS.
 

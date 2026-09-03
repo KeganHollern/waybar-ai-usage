@@ -8,6 +8,22 @@
  * ~/.config/waybar/icons/ai/.
  */
 
+/* A small popup surface that matches the dark desktop theme. */
+tooltip {
+    background-color: rgba(17, 17, 27, 0.96);
+    background-image: none;
+    border: 1px solid rgba(51, 204, 255, 0.38);
+    border-radius: 12px;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+    padding: 0;
+}
+
+tooltip label {
+    color: rgba(255, 255, 255, 0.74);
+    padding: 10px 12px;
+    text-shadow: none;
+}
+
 /* The island container. Drop this block if you already style module groups. */
 #ai {
     border: 2px solid transparent;
