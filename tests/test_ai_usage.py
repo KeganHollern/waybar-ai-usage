@@ -4,9 +4,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest import mock
@@ -172,30 +175,7 @@ class OmpUsageTests(unittest.TestCase):
         self.assertEqual(result["claude"]["blockers"], [
             {"label": "Session", "resets_at": None},
         ])
-        self.assertTrue(result["grok"]["exhausted"])
-        self.assertEqual(result["grok"]["blockers"], [
-            {"label": "Credits", "resets_at": None},
-        ])
-
-    def test_grok_on_demand_is_an_alternative_to_included_quota(self):
-        payload = {
-            "reports": [{
-                "provider": "xai-oauth",
-                "limits": [
-                    omp_limit(
-                        "xai-oauth:credits:1w", 0,
-                        status="exhausted", label="Credits"),
-                    omp_limit(
-                        "xai-oauth:on-demand", 0.5,
-                        status="available", label="On-demand"),
-                ],
-            }],
-        }
-
-        result = ai_usage.parse_omp_usage(payload)["grok"]
-
-        self.assertFalse(result["exhausted"])
-        self.assertEqual(result["blockers"], [])
+        self.assertNotIn("grok", result)
 
     def test_healthy_second_account_keeps_provider_available(self):
         payload = {
@@ -236,6 +216,182 @@ class OmpUsageTests(unittest.TestCase):
         self.assertFalse(result["exhausted"])
         self.assertEqual(result["blockers"], [])
         self.assertIn("Another account: usage unavailable", result["lines"])
+
+
+class GrokUsageTests(unittest.TestCase):
+    def test_native_weekly_usage_and_display_safe_fields(self):
+        result = ai_usage.parse_grok_usage({
+            "config": {
+                "creditUsagePercent": 2.0,
+                "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                                  "end": "2030-01-01T00:00:00Z"},
+                "onDemandCap": {}, "onDemandUsed": {}, "prepaidBalance": {},
+                "history": [{"accountId": "must-not-be-cached"}],
+            },
+            "subscription_tier": "X Premium+",
+            "token": "must-not-be-cached",
+        })
+        self.assertEqual(result["pct"], 98)
+        self.assertTrue(result["lines"][0].startswith("Weekly: 98% left"))
+        self.assertIn("Prepaid credits: $0.00", result["lines"])
+        self.assertIn("plan: X Premium+", result["lines"])
+        self.assertEqual(result["source"], "grok-build")
+        self.assertFalse(result["exhausted"])
+        self.assertNotIn("must-not-be-cached", json.dumps(result))
+        output = emit_json("grok", {"providers": {"grok": result}})
+        self.assertEqual(output["percentage"], 98)
+        self.assertIn("98%", output["text"])
+        ET.fromstring("<root>" + output["tooltip"] + "</root>")
+
+    def test_exhaustion_has_a_reset_and_allows_paid_alternatives(self):
+        for extra, enabled, exhausted in (
+                ({}, None, True),
+                ({"prepaidBalance": {"val": 100}}, False, False),
+                ({"onDemandCap": {"val": 500}, "onDemandUsed": {}}, True, False),
+                ({"onDemandCap": {"val": 500}, "onDemandUsed": {}}, False, True),
+                ({"onDemandCap": {"val": 500},
+                  "onDemandUsed": {"val": 500}}, True, True)):
+            with self.subTest(extra=extra, enabled=enabled):
+                result = ai_usage.parse_grok_usage({
+                    "config": {"creditUsagePercent": 100,
+                               "currentPeriod": {
+                                   "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                                   "end": "2030-01-01T00:00:00Z"}, **extra},
+                    "on_demand_enabled": enabled,
+                })
+                self.assertEqual(result["exhausted"], exhausted)
+                self.assertEqual(result["blockers"], [
+                    {"label": "Weekly", "resets_at": 1893456000000},
+                ] if exhausted else [])
+
+    def test_legacy_cents_and_zero_scalar_default(self):
+        result = ai_usage.parse_grok_usage({"config": {
+            "monthlyLimit": {"val": 2000}, "used": {},
+        }})
+        self.assertEqual(result["pct"], 100)
+        result = ai_usage.parse_grok_usage({"config": {
+            "monthlyLimit": {"val": 2000}, "used": {"val": 500},
+        }})
+        self.assertEqual(result["pct"], 75)
+        self.assertEqual(result["summary"], "75% of monthly quota left")
+
+    def test_percent_precedes_legacy_counts_and_clamps(self):
+        for used, expected in ((0, 100), (20, 80), (120, 0), (-5, 100)):
+            with self.subTest(used=used):
+                result = ai_usage.parse_grok_usage({"config": {
+                    "creditUsagePercent": used,
+                    "monthlyLimit": {"val": 2000}, "used": {"val": 1000},
+                    "currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY"},
+                }})
+                self.assertEqual(result["pct"], expected)
+                self.assertTrue(result["lines"][0].startswith("Monthly:"))
+                self.assertEqual(result["summary"],
+                                 "{}% of monthly quota left".format(expected))
+
+    def test_missing_or_invalid_quota_never_becomes_full_allowance(self):
+        for payload in (None, {}, {"config": {}}, {"config": None},
+                        {"config": {"creditUsagePercent": True}},
+                        {"config": {"creditUsagePercent": "NaN"}},
+                        {"config": {"monthlyLimit": {}, "used": {}}}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                ai_usage.parse_grok_usage(payload)
+
+    @contextlib.contextmanager
+    def fake_cli(self, mode="ok"):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "grok"
+            binary.write_text("#!" + sys.executable + "\n" +
+                              "mode = " + repr(mode) + "\n" + textwrap.dedent('''
+                import json, os, pathlib, sys, time
+                pathlib.Path("pid").write_text(str(os.getpid()))
+                assert sys.argv[1:] == ["agent", "--no-leader", "stdio"]
+                def read():
+                    return json.loads(sys.stdin.readline())
+                init = read()
+                assert init["method"] == "initialize"
+                assert init["params"]["clientCapabilities"] == {}
+                print(json.dumps({"jsonrpc": "2.0", "id": init["id"],
+                                  "result": {"protocolVersion": 1}}))
+                print(json.dumps({"jsonrpc": "2.0", "method": "notice"}), flush=True)
+                billing = read()
+                assert billing["method"] == "_x.ai/billing"
+                assert billing["params"] == {}
+                if mode == "eof":
+                    sys.exit(0)
+                if mode == "timeout":
+                    time.sleep(60)
+                if mode == "invalid":
+                    print("invalid-json", flush=True)
+                elif mode == "server_request":
+                    print(json.dumps({"id": 99, "method": "session/request_permission"}), flush=True)
+                else:
+                    response = {"jsonrpc": "2.0", "id": billing["id"],
+                                "result": {"config": {"creditUsagePercent": 2}}}
+                    if mode == "error":
+                        response = {"id": billing["id"],
+                                    "error": {"code": -32603, "message": "secret-token"}}
+                        print("secret-token", file=sys.stderr)
+                    encoded = json.dumps(response) + "\\n"
+                    sys.stdout.write(encoded[:10]); sys.stdout.flush()
+                    time.sleep(0.01)
+                    sys.stdout.write(encoded[10:]); sys.stdout.flush()
+                # The client must close this process after the response/error.
+                time.sleep(60)
+            '''))
+            binary.chmod(0o755)
+            with mock.patch.object(ai_usage, "grok_binary", return_value=str(binary)), \
+                    mock.patch.object(ai_usage, "HOME", tmp):
+                yield Path(tmp)
+            pid = int((Path(tmp) / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_cli_protocol_reads_quota_without_a_prompt(self):
+        with self.fake_cli():
+            self.assertEqual(ai_usage.fetch_grok()["pct"], 98)
+
+    def test_cli_failures_stop_process_and_do_not_expose_errors(self):
+        for mode, error in (("error", RuntimeError), ("invalid", ValueError),
+                            ("eof", RuntimeError), ("server_request", RuntimeError)):
+            with self.subTest(mode=mode), self.fake_cli(mode):
+                with self.assertRaises(error) as caught:
+                    ai_usage.grok_billing(timeout=2)
+                self.assertNotIn("secret-token", str(caught.exception))
+
+    def test_cli_timeout_stops_process(self):
+        with self.fake_cli("timeout"):
+            with self.assertRaises(TimeoutError):
+                ai_usage.grok_billing(timeout=0.2)
+
+    def test_minimal_waybar_path_finds_native_install(self):
+        with mock.patch.object(ai_usage.shutil, "which", return_value=None), \
+                mock.patch.object(ai_usage.os, "access", side_effect=(False, True)):
+            self.assertEqual(ai_usage.grok_binary(),
+                             os.path.join(ai_usage.HOME, ".grok", "bin", "grok"))
+
+    def test_refresh_keeps_grok_independent_from_omp(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(ai_usage, "STATE_PATH", tmp + "/state"))
+            for name in ("fetch_gemini", "fetch_zai", "fetch_openrouter", "fetch_meta"):
+                stack.enter_context(mock.patch.object(ai_usage, name, return_value={"pct": 50}))
+            omp = stack.enter_context(mock.patch.object(ai_usage, "fetch_omp"))
+            grok = stack.enter_context(mock.patch.object(ai_usage, "fetch_grok"))
+            omp.side_effect = RuntimeError("OMP failed")
+            grok.return_value = {"pct": 98, "source": "grok-build"}
+            state = ai_usage.refresh({})
+            self.assertEqual(state["providers"]["grok"]["pct"], 98)
+
+            omp.side_effect = None
+            omp.return_value = {"grok": {"pct": 30}}
+            grok.side_effect = RuntimeError("Native usage failed")
+            state = ai_usage.refresh(state)
+            self.assertEqual(state["providers"]["grok"]["pct"], 98)
+            self.assertTrue(state["providers"]["grok"]["stale"])
+
+            old = {"providers": {"grok": {"pct": 30, "ts": time.time()}}}
+            state = ai_usage.refresh(old)
+            self.assertNotIn("pct", state["providers"]["grok"])
+            self.assertEqual(state["providers"]["grok"]["error"], "Native usage failed")
 
 
 class OpenRouterUsageTests(unittest.TestCase):

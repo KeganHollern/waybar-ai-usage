@@ -8,7 +8,8 @@ modules show the weekly percentage. OpenRouter shows the USD credit balance.
 Values use a green->yellow->red gradient that matches the desktop theme.
 
 Data sources:
-  codex/claude/grok : `omp usage --json` (Oh My Pi aggregates these accounts)
+  codex/claude      : `omp usage --json` (Oh My Pi aggregates these accounts)
+  grok              : Grok Build CLI's native ACP billing interface
   gemini            : `agy -p /usage` (Antigravity CLI). Falls back to
                       cloudcode-pa retrieveUserQuota via gemini-cli OAuth
                       (~/.gemini/oauth_creds.json) if agy is not signed in.
@@ -29,6 +30,7 @@ import html
 import json
 import math
 import os
+import selectors
 import sqlite3
 import shutil
 import subprocess
@@ -212,7 +214,6 @@ OMP_BLOCKING_IDS = {
     # Product/model-specific rows are alternatives, not provider-wide gates.
     "codex": {"openai-codex:primary", "openai-codex:secondary"},
     "claude": {"anthropic:5h", "anthropic:7d"},
-    "grok": {"xai-oauth:credits:1w", "xai-oauth:included:1mo"},
 }
 
 
@@ -262,8 +263,6 @@ def parse_omp_usage(payload):
     for key, provider, primary in (
         ("codex", "openai-codex", "openai-codex:primary"),
         ("claude", "anthropic", "anthropic:7d"),
-        ("grok", "xai-oauth",
-         ("xai-oauth:credits:1w", "xai-oauth:included:1mo")),
     ):
         provider_reports = reports.get(provider) or []
         if not provider_reports:
@@ -286,21 +285,8 @@ def parse_omp_usage(payload):
                         (limit.get("window") or {}).get("resetsAt")),
                 })
 
-            # One report is one account. For Grok, included quota and
-            # on-demand billing can be two alternatives inside that account.
+            # One report is one account.
             paths = [blockers] if blockers else []
-            if key == "grok":
-                on_demand = [limit for limit in rep.get("limits", [])
-                             if limit.get("id") == "xai-oauth:on-demand"]
-                if on_demand:
-                    on_demand_blockers = [{
-                        "label": limit.get("label") or "On-demand",
-                        "resets_at": epoch_ms(
-                            (limit.get("window") or {}).get("resetsAt")),
-                    } for limit in on_demand if _omp_limit_exhausted(limit)]
-                    paths = ([blockers, on_demand_blockers]
-                             if blockers and on_demand_blockers else [])
-                    blockers = blockers + on_demand_blockers if paths else []
 
             parsed_reports.append({
                 "pct": main["amount"]["remainingFraction"] * 100,
@@ -313,7 +299,7 @@ def parse_omp_usage(payload):
         if not parsed_reports:
             continue
         # Accounts are alternatives. The provider is out only when each
-        # account (and each billing lane in that account) is blocked.
+        # account is blocked.
         exhausted = (provider not in unknown_providers
                      and all(report["paths"] for report in parsed_reports))
         blocker_paths = ([path for report in parsed_reports
@@ -342,12 +328,160 @@ def parse_omp_usage(payload):
 
 
 def fetch_omp():
-    """One omp call feeds codex, claude, and grok."""
+    """One omp call feeds codex and claude."""
     out = subprocess.run(
         [omp_binary(), "usage", "--json"],
         capture_output=True, text=True, timeout=90, check=True,
     ).stdout
     return parse_omp_usage(json.loads(out))
+
+
+def grok_binary():
+    """Find Grok Build even with Waybar's minimal PATH."""
+    found = shutil.which("grok")
+    if found:
+        return found
+    for candidate in (os.path.join(HOME, ".local", "bin", "grok"),
+                      os.path.join(HOME, ".grok", "bin", "grok"),
+                      "/usr/local/bin/grok", "/usr/bin/grok"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError("Grok Build CLI was not found. Install grok first.")
+
+
+def grok_billing(timeout=45):
+    """Read /usage data through Grok's ACP interface, without a model turn.
+
+    `grok usage --json` does not support the native shell route in 1.0.89.
+    The TUI uses this same billing request. Grok owns auth and token refresh;
+    this script never reads its credentials or creates a conversation.
+    """
+    with subprocess.Popen(
+            [grok_binary(), "agent", "--no-leader", "stdio"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, cwd=HOME,
+    ) as process, selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        buffer = b""
+
+        def request(request_id, method, params):
+            nonlocal buffer
+            message = {"jsonrpc": "2.0", "id": request_id,
+                       "method": method, "params": params}
+            process.stdin.write((json.dumps(message) + "\n").encode())
+            process.stdin.flush()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Grok Build usage request timed out.")
+                if b"\n" not in buffer:
+                    if not selector.select(timeout=remaining):
+                        raise TimeoutError("Grok Build usage request timed out.")
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise RuntimeError("Grok Build closed its usage connection.")
+                    buffer += chunk
+                    if len(buffer) > 1024 * 1024:
+                        raise ValueError("Grok Build usage response is too large.")
+                    continue
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    response = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    raise ValueError("Grok Build returned invalid JSON.") from None
+                if not isinstance(response, dict):
+                    raise ValueError("Grok Build returned an invalid response.")
+                # Notifications can arrive between replies. Do not accept
+                # server requests (tools, authentication, or permissions).
+                if "method" in response:
+                    if "id" in response:
+                        raise RuntimeError("Grok Build requested an unsupported action.")
+                    continue
+                if response.get("id") != request_id:
+                    continue
+                if "error" in response:
+                    # Never put raw CLI errors, auth data, or stderr in cache.
+                    raise RuntimeError(
+                        "Grok Build could not read usage. Check grok login.")
+                result = response.get("result")
+                if not isinstance(result, dict):
+                    raise ValueError("Grok Build returned no usage response.")
+                return result
+
+        try:
+            request(1, "initialize", {
+                "protocolVersion": 1,
+                "clientInfo": {"name": "waybar-ai-usage", "version": "1"},
+                "clientCapabilities": {},
+            })
+            return request(2, "_x.ai/billing", {})
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def parse_grok_usage(payload):
+    """Convert Grok Build's billing response into display-safe quota data."""
+    config = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(config, dict):
+        raise ValueError("Grok Build returned no plan usage.")
+
+    def cents(key):
+        value = config.get(key)
+        # Protobuf JSON represents a zero Cent as {}.
+        if isinstance(value, dict):
+            return finite_number(value.get("val", 0))
+        return None
+
+    used = finite_number(config.get("creditUsagePercent"))
+    if used is None:
+        limit, spent = cents("monthlyLimit"), cents("used")
+        if limit is None or limit <= 0 or spent is None:
+            raise ValueError("Grok Build returned no quota percentage.")
+        used = spent / limit * 100
+    pct = max(0.0, min(100.0, 100 - used))
+    period = config.get("currentPeriod") or {}
+    period_type = period.get("type")
+    default_label = "Monthly" if "monthlyLimit" in config else "Included"
+    label = {"USAGE_PERIOD_TYPE_WEEKLY": "Weekly",
+             "USAGE_PERIOD_TYPE_MONTHLY": "Monthly"}.get(period_type, default_label)
+    resets_at = epoch_ms(period.get("end") or config.get("billingPeriodEnd"))
+    line = "{}: {}% left".format(label, round(pct))
+    reset = fmt_reset(resets_at)
+    if reset:
+        line += "  (resets {})".format(reset)
+    lines = [line]
+
+    prepaid = cents("prepaidBalance")
+    cap, spent = cents("onDemandCap"), cents("onDemandUsed")
+    on_demand_left = (max(0, cap - spent)
+                      if cap is not None and spent is not None else 0)
+    on_demand_available = (payload.get("on_demand_enabled") is not False
+                           and on_demand_left > 0)
+    if prepaid is not None:
+        lines.append("Prepaid credits: {}".format(money(prepaid / 100)))
+    if cap is not None and cap > 0 and payload.get("on_demand_enabled") is not False:
+        lines.append("On-demand: {} left".format(money(on_demand_left / 100)))
+    tier = payload.get("subscription_tier")
+    if isinstance(tier, str) and tier.strip():
+        lines.append("plan: " + tier.strip())
+    lines.append("Source: Grok Build CLI")
+    exhausted = (used >= 100 and not (prepaid and prepaid > 0)
+                 and not on_demand_available)
+    blockers = [{"label": label, "resets_at": resets_at}] if exhausted else []
+    return {"pct": pct, "lines": lines, "exhausted": bool(exhausted),
+            "blockers": blockers, "source": "grok-build",
+            "summary": "{}% of {} quota left".format(round(pct), label.lower())}
+
+
+def fetch_grok():
+    return parse_grok_usage(grok_billing())
 
 
 def agy_binary():
@@ -1153,6 +1287,8 @@ def refresh(old):
 
     def keep_old(key, err):
         prev = old.get("providers", {}).get(key)
+        if key == "grok" and prev and prev.get("source") != "grok-build":
+            prev = None  # Never carry forward the old OMP Grok account.
         if prev and now - prev.get("ts", 0) < STALE_LIMIT:
             prev = dict(prev)
             prev["stale"] = True
@@ -1164,16 +1300,17 @@ def refresh(old):
         omp = fetch_omp()
     except Exception as e:  # omp missing/timeout/parse
         omp = None
-        for key in ("codex", "claude", "grok"):
+        for key in ("codex", "claude"):
             keep_old(key, e)
     if omp is not None:
-        for key in ("codex", "claude", "grok"):
+        for key in ("codex", "claude"):
             if key in omp:
                 providers[key] = {**omp[key], "ts": now}
             else:
                 keep_old(key, "not reported by omp")
 
-    for key, fn in (("gemini", fetch_gemini), ("zai", fetch_zai),
+    for key, fn in (("grok", fetch_grok),
+                    ("gemini", fetch_gemini), ("zai", fetch_zai),
                     ("openrouter", fetch_openrouter),
                     ("muse", fetch_meta)):
         try:

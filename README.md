@@ -30,7 +30,8 @@ If an empty limit resets before 5 minutes, the script refreshes at that reset.
 
 | Provider | Data source |
 |---|---|
-| `codex`, `claude`, `grok` | `omp usage --json` — the [Oh My Pi](https://github.com/acidsugarx/oh-my-pi) CLI aggregates these accounts |
+| `codex`, `claude` | `omp usage --json` — the [Oh My Pi](https://github.com/acidsugarx/oh-my-pi) CLI aggregates these accounts |
+| `grok` | Grok Build CLI's native ACP billing interface, with the Grok Build login |
 | `gemini` | `agy -p /usage --output-format json` — [Antigravity CLI](https://antigravity.google/docs/cli/getting-started) (`agy`). Falls back to the old `cloudcode-pa` quota API via `gemini-cli` OAuth (`~/.gemini/oauth_creds.json`) if `agy` is not signed in |
 | `zai` | `api.z.ai` quota API, token read from omp's credential store (`~/.omp/agent/agent.db`) |
 | `openrouter` | OpenRouter [`/credits`](https://openrouter.ai/docs/api/api-reference/credits/get-credits) and [`/keys`](https://openrouter.ai/docs/api/api-reference/api-keys/list) management APIs |
@@ -44,7 +45,8 @@ these tools, adapting a fetcher to your own token source is a ~40-line job.
 - [Waybar](https://github.com/Alexays/Waybar)
 - Python 3 (stdlib only — no pip packages)
 - Per provider:
-  - **codex / claude / grok** — `omp` CLI, logged into the accounts
+  - **codex / claude** — `omp` CLI, logged into the accounts
+  - **grok** — Grok Build CLI, authenticated with `grok login`
   - **gemini** — `agy` (Antigravity CLI), signed in via Google; or `gemini-cli` as a fallback
   - **zai** — a Z.AI credential in omp's store
   - **openrouter** — an OpenRouter management API key
@@ -75,6 +77,28 @@ Sanity-check a provider from a terminal first:
 ```sh
 ~/.config/waybar/scripts/ai-usage.py claude
 ```
+
+### Grok Build setup
+
+Install [Grok Build](https://docs.x.ai/build/overview), then run `grok login`.
+The module finds `grok` on `PATH`, in `~/.local/bin`, or in `~/.grok/bin`.
+This also works with Waybar's minimal `PATH`.
+
+The module starts `grok agent --no-leader stdio` and sends the ACP
+`initialize` and `_x.ai/billing` requests. This is the native interface that
+Grok Build's `/usage` view uses. Grok Build manages the login and token refresh.
+The module sends no prompt and creates no conversation. It stops the CLI
+process after the response or a timeout.
+
+Grok Build 1.0.89 rejects `grok usage --json` on its native shell route.
+The ACP billing interface works on that route. The module uses this interface
+directly and does not use OMP for Grok data.
+
+The value shows the percentage of the included quota that is left.
+The tooltip shows the reset time, plan, prepaid balance, and available on-demand
+credit. Prepaid credit or available on-demand credit prevents a false exhausted
+state when the included quota is empty. The cache keeps only display data.
+Old OMP Grok data cannot replace native Grok data after a failed request.
 
 ### OpenRouter setup
 
@@ -163,8 +187,9 @@ quietly into the shared cache, so removing the module is all that's needed.
   secret is obviously not treated as a secret"). They are only used for the
   `gemini-cli` fallback: the script *reads* that refresh token and caches its
   own access token; it never writes to gemini-cli's files.
-- The script runs read-only against provider APIs and local credential
-  stores; the only state it writes lives in `~/.cache/waybar-ai-usage/`.
+- The script reads provider APIs and local credential stores.
+  Its own state stays in `~/.cache/waybar-ai-usage/`.
+  Provider CLIs can update their own login files, logs, and caches.
   The Muse probe is the one exception: one minimal streamed response per
   quota window (see Muse setup).
 - A zero OpenRouter credit balance means that paid requests are out of credit.
