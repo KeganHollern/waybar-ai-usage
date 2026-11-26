@@ -21,8 +21,8 @@ Data sources:
                       is cached until its reset time, so one refresh pass
                       costs at most one prompt per quota window.
 
-All module instances share one cache (~/.cache/waybar-ai-usage) guarded
-by a lock file, so a bar refresh performs a single fetch pass.
+Each module refreshes its own usage source. Codex and Claude share one OMP
+request. All modules merge their results into ~/.cache/waybar-ai-usage.
 """
 
 import fcntl
@@ -45,7 +45,6 @@ from datetime import datetime, timezone
 HOME = os.path.expanduser("~")
 CACHE_DIR = os.path.join(HOME, ".cache", "waybar-ai-usage")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
-LOCK_PATH = os.path.join(CACHE_DIR, "lock")
 GEMINI_TOKEN_CACHE = os.path.join(CACHE_DIR, "gemini-token.json")
 DEFAULT_CONFIG_HOME = os.path.join(HOME, ".config")
 XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", "")
@@ -331,6 +330,7 @@ def fetch_omp():
     """One omp call feeds codex and claude."""
     out = subprocess.run(
         [omp_binary(), "usage", "--json"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
         capture_output=True, text=True, timeout=90, check=True,
     ).stdout
     return parse_omp_usage(json.loads(out))
@@ -359,7 +359,7 @@ def grok_billing(timeout=45):
     with subprocess.Popen(
             [grok_binary(), "agent", "--no-leader", "stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, cwd=HOME,
+            stderr=subprocess.DEVNULL, cwd=HOME, start_new_session=True,
     ) as process, selectors.DefaultSelector() as selector:
         selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
@@ -619,6 +619,7 @@ def fetch_agy():
     proc = subprocess.run(
         [agy_binary(), "-p", "/usage", "--output-format", "json",
          "--print-timeout", "30s"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
         capture_output=True, text=True, timeout=45,
     )
     if proc.returncode != 0:
@@ -1276,54 +1277,50 @@ def fetch_meta():
 def load_state():
     try:
         with open(STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
+        if isinstance(state, dict) and isinstance(state.get("providers"), dict):
+            return state
     except (OSError, ValueError):
-        return {"fetched_at": 0, "providers": {}}
+        pass
+    return {"providers": {}}
 
 
-def refresh(old):
-    now = time.time()
-    providers = {}
+def previous_value(provider, data, error, now):
+    """Keep the last successful sample until its original timestamp expires."""
+    if isinstance(data, dict) and finite_number(data.get("pct")) is not None:
+        ts = finite_number(data.get("ts"))
+        valid_source = provider != "grok" or data.get("source") == "grok-build"
+        if valid_source and ts is not None and 0 <= now - ts < STALE_LIMIT:
+            return {**data, "stale": True}
+    return {"error": str(error) or type(error).__name__, "ts": now}
 
-    def keep_old(key, err):
-        prev = old.get("providers", {}).get(key)
-        if key == "grok" and prev and prev.get("source") != "grok-build":
-            prev = None  # Never carry forward the old OMP Grok account.
-        if prev and now - prev.get("ts", 0) < STALE_LIMIT:
-            prev = dict(prev)
-            prev["stale"] = True
-            providers[key] = prev
-        else:
-            providers[key] = {"error": str(err) or err.__class__.__name__, "ts": now}
 
+def refresh_source(source, old):
+    """Fetch one source. OMP returns both of its provider entries at once."""
+    started = time.time()
+    keys = ("codex", "claude") if source == "omp" else (source,)
+    error = "not reported by omp"
     try:
-        omp = fetch_omp()
-    except Exception as e:  # omp missing/timeout/parse
-        omp = None
-        for key in ("codex", "claude"):
-            keep_old(key, e)
-    if omp is not None:
-        for key in ("codex", "claude"):
-            if key in omp:
-                providers[key] = {**omp[key], "ts": now}
-            else:
-                keep_old(key, "not reported by omp")
+        if source == "omp":
+            samples = fetch_omp()
+        else:
+            fetcher = {"grok": fetch_grok, "gemini": fetch_gemini,
+                       "zai": fetch_zai, "openrouter": fetch_openrouter,
+                       "muse": fetch_meta}[source]
+            samples = {source: fetcher()}
+    except Exception as exc:
+        samples = {}
+        error = exc
 
-    for key, fn in (("grok", fetch_grok),
-                    ("gemini", fetch_gemini), ("zai", fetch_zai),
-                    ("openrouter", fetch_openrouter),
-                    ("muse", fetch_meta)):
-        try:
-            providers[key] = {**fn(), "ts": now}
-        except Exception as e:
-            keep_old(key, e)
-
-    state = {"fetched_at": now, "providers": providers}
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_PATH)
-    return state
+    now = time.time()
+    updates = {}
+    for key in keys:
+        if key in samples:
+            data = {**samples[key], "ts": now}
+        else:
+            data = previous_value(key, old.get(key), error, now)
+        updates[key] = {**data, "checked_at": started}
+    return updates
 
 
 def active_blockers(data, now=None):
@@ -1352,43 +1349,69 @@ def active_blockers(data, now=None):
     return active_in(blockers)
 
 
-def state_needs_refresh(state, now=None):
-    """Refresh on the normal TTL or as soon as a blocked limit resets."""
+def state_needs_refresh(state, provider, now=None):
+    """Check this provider's TTL, manual refresh request, and quota reset."""
     now = time.time() if now is None else now
-    fetched_at = finite_number(state.get("fetched_at")) or 0
-    if now - fetched_at >= TTL:
+    data = state["providers"].get(provider)
+    if not isinstance(data, dict):
         return True
-    for data in state.get("providers", {}).values():
-        for blocker in data.get("blockers") or []:
-            resets_at = finite_number(blocker.get("resets_at"))
-            if resets_at is None:
-                continue
-            reset_seconds = resets_at / 1000.0
-            if fetched_at < reset_seconds <= now:
-                return True
+    if provider == "grok" and "pct" in data and data.get("source") != "grok-build":
+        return True
+    # Older releases used one fetch timestamp for all providers.
+    checked = finite_number(data.get("checked_at", state.get("fetched_at")))
+    if checked is None or not 0 <= now - checked < TTL:
+        return True
+    if data.get("stale") and now - (finite_number(data.get("ts")) or 0) >= STALE_LIMIT:
+        return True
+    try:
+        if os.path.getmtime(os.path.join(CACHE_DIR, "refresh")) > checked:
+            return True
+    except FileNotFoundError:
+        pass
+    for blocker in data.get("blockers") or []:
+        reset = finite_number(blocker.get("resets_at"))
+        if reset is not None and checked < reset / 1000.0 <= now:
+            return True
     return False
 
 
-def get_state():
+def get_state(provider):
     os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-    lock = open(LOCK_PATH, "w")
-    deadline = time.time() + 120
-    while True:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError:
-            if time.time() > deadline:  # fetcher wedged; serve whatever exists
-                return load_state()
-            time.sleep(0.5)
-    try:
-        state = load_state()
-        if state_needs_refresh(state):
-            state = refresh(state)
+    state = load_state()
+    if not state_needs_refresh(state, provider):
         return state
-    finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
+
+    source = "omp" if provider in ("codex", "claude") else provider
+    with open(os.path.join(CACHE_DIR, source + ".lock"), "a") as lock:
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                fallback = previous_value(
+                    provider, state["providers"].get(provider),
+                    "Usage refresh is still in progress", time.time())
+                if fallback.get("stale") or time.monotonic() >= deadline:
+                    state["providers"][provider] = fallback
+                    return state
+                time.sleep(0.2)
+
+        state = load_state()
+        if not state_needs_refresh(state, provider):
+            return state
+        updates = refresh_source(source, state["providers"])
+        # Another source can finish during the fetch. Merge under a
+        # short write lock so its completed samples survive this write.
+        with open(os.path.join(CACHE_DIR, "state.lock"), "a") as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX)
+            state = load_state()
+            state["providers"].update(updates)
+            tmp = STATE_PATH + ".new"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, STATE_PATH)
+        return state
 
 
 def _tooltip_escape(value):
@@ -1646,7 +1669,7 @@ def main():
     if len(sys.argv) != 2 or sys.argv[1] not in PROVIDERS:
         sys.stderr.write("usage: ai-usage.py <%s>\n" % "|".join(PROVIDERS))
         sys.exit(2)
-    emit(sys.argv[1], get_state())
+    emit(sys.argv[1], get_state(sys.argv[1]))
 
 
 if __name__ == "__main__":

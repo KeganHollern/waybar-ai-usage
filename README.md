@@ -21,12 +21,18 @@ In context, on a Hyprland bar:
 
 ## How it works
 
-`ai-usage.py <provider>` prints one Waybar `custom` module JSON line. All
-module instances share one cache (`~/.cache/waybar-ai-usage`) guarded by a
-lock file, so one bar refresh performs one fetch pass.
-Fetched data stays fresh for 5 minutes; if a provider fetch fails, the last
-known value is shown dimmed (up to 3 hours) before falling back to `--`.
-If an empty limit resets before 5 minutes, the script refreshes at that reset.
+`ai-usage.py <provider>` prints one Waybar `custom` module JSON line.
+Each module fetches its own source. Codex and Claude share one OMP request.
+Each source can save its results while another source waits for a response.
+The modules share one cache in `~/.cache/waybar-ai-usage`.
+
+The script checks for fresh data every 5 minutes or on a manual refresh.
+It also checks for a quota reset when the module runs.
+If a request fails, the module shows the last value in dim text for up to
+3 hours after the last successful request. Then it shows `--`.
+
+For an upgrade, copy the new `on-click` commands from `waybar/config.jsonc`.
+They mark the cache for a refresh and keep the last successful values.
 
 | Provider | Data source |
 |---|---|
@@ -157,10 +163,8 @@ a refresh with a left-click.
 
 ### Dropping providers
 
-Each provider is an independent module: to skip one, remove its
-`custom/ai-<name>` entry and its line in `group/ai`. A refresh pass still
-tries every fetcher regardless; providers without credentials just fail
-quietly into the shared cache, so removing the module is all that's needed.
+Remove the provider from `group/ai` to stop its requests. If either Codex
+or Claude is active, OMP still reports both in one request.
 
 ## Theming
 

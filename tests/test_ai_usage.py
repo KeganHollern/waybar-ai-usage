@@ -1,6 +1,7 @@
 """Tests for the Waybar AI usage data and output rules."""
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
@@ -10,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -369,29 +371,124 @@ class GrokUsageTests(unittest.TestCase):
             self.assertEqual(ai_usage.grok_binary(),
                              os.path.join(ai_usage.HOME, ".grok", "bin", "grok"))
 
-    def test_refresh_keeps_grok_independent_from_omp(self):
-        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(ai_usage, "STATE_PATH", tmp + "/state"))
-            for name in ("fetch_gemini", "fetch_zai", "fetch_openrouter", "fetch_meta"):
-                stack.enter_context(mock.patch.object(ai_usage, name, return_value={"pct": 50}))
-            omp = stack.enter_context(mock.patch.object(ai_usage, "fetch_omp"))
-            grok = stack.enter_context(mock.patch.object(ai_usage, "fetch_grok"))
-            omp.side_effect = RuntimeError("OMP failed")
-            grok.return_value = {"pct": 98, "source": "grok-build"}
-            state = ai_usage.refresh({})
-            self.assertEqual(state["providers"]["grok"]["pct"], 98)
 
-            omp.side_effect = None
-            omp.return_value = {"grok": {"pct": 30}}
-            grok.side_effect = RuntimeError("Native usage failed")
-            state = ai_usage.refresh(state)
-            self.assertEqual(state["providers"]["grok"]["pct"], 98)
-            self.assertTrue(state["providers"]["grok"]["stale"])
+class SourceRefreshTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cache = Path(tmp.name)
+        self.state_file = self.cache / "state.json"
+        for key, value in (("CACHE_DIR", tmp.name), ("STATE_PATH", str(self.state_file))):
+            patcher = mock.patch.object(ai_usage, key, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-            old = {"providers": {"grok": {"pct": 30, "ts": time.time()}}}
-            state = ai_usage.refresh(old)
-            self.assertNotIn("pct", state["providers"]["grok"])
-            self.assertEqual(state["providers"]["grok"]["error"], "Native usage failed")
+    def test_slow_omp_does_not_block_grok_or_lose_concurrent_updates(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_omp():
+            started.set()
+            if not release.wait(4):
+                raise TimeoutError("test OMP request timed out")
+            return {"claude": {"pct": 30}, "codex": {"pct": 65}}
+
+        with contextlib.ExitStack() as stack:
+            for name in ("fetch_meta", "fetch_gemini", "fetch_zai", "fetch_openrouter"):
+                fn = stack.enter_context(mock.patch.object(ai_usage, name))
+                self.addCleanup(fn.assert_not_called)
+            omp = stack.enter_context(mock.patch.object(ai_usage, "fetch_omp", side_effect=slow_omp))
+            grok = stack.enter_context(mock.patch.object(
+                ai_usage, "fetch_grok", return_value={"pct": 98, "source": "grok-build"}))
+            pool = stack.enter_context(ThreadPoolExecutor(max_workers=3))
+            codex = pool.submit(ai_usage.get_state, "codex")
+            self.assertTrue(started.wait(2))
+            claude = pool.submit(ai_usage.get_state, "claude")
+            try:
+                result = pool.submit(ai_usage.get_state, "grok").result(timeout=2)
+                self.assertEqual(result["providers"]["grok"]["pct"], 98)
+                self.assertEqual(json.loads(self.state_file.read_text()), result)
+            finally:
+                release.set()
+            self.assertEqual(codex.result()["providers"]["codex"]["pct"], 65)
+            self.assertEqual(claude.result()["providers"]["claude"]["pct"], 30)
+            self.assertEqual(set(ai_usage.load_state()["providers"]), {"codex", "claude", "grok"})
+            omp.assert_called_once()
+            grok.assert_called_once()
+
+    def test_busy_source_serves_cached_value_while_other_sources_refresh(self):
+        self.state_file.write_text(json.dumps({"providers": {
+            "codex": {"pct": 60, "ts": time.time() - ai_usage.TTL},
+        }}))
+        with (self.cache / "omp.lock").open("a") as lock, \
+                mock.patch.object(ai_usage, "fetch_omp") as omp, \
+                mock.patch.object(ai_usage, "fetch_openrouter", return_value={"pct": 20}):
+            ai_usage.fcntl.flock(lock, ai_usage.fcntl.LOCK_EX)
+            cached = ai_usage.get_state("codex")["providers"]["codex"]
+            self.assertTrue(cached["stale"])
+            self.assertEqual(cached["pct"], 60)
+            self.assertEqual(ai_usage.get_state("openrouter")["providers"]["openrouter"]["pct"], 20)
+            omp.assert_not_called()
+
+    def test_click_preserves_last_good_value_and_expires_it_after_three_hours(self):
+        sample = {"pct": 93, "ts": 1000, "source": "grok-build"}
+        self.state_file.write_text(json.dumps({"providers": {"grok": sample}, "fetched_at": 1000}))
+        with mock.patch.object(ai_usage, "fetch_grok", side_effect=ValueError("offline")) as fetch, \
+                mock.patch.object(ai_usage.time, "time", return_value=1010) as now:
+            self.assertEqual(ai_usage.get_state("grok")["providers"]["grok"], sample)
+            marker = self.cache / "refresh"
+            marker.touch()
+            os.utime(marker, (1005, 1005))
+            stale = ai_usage.get_state("grok")["providers"]["grok"]
+            self.assertTrue(stale["stale"])
+            self.assertEqual((stale["pct"], stale["ts"]), (93, 1000))
+            ai_usage.get_state("grok")
+            fetch.assert_called_once()
+
+            now.return_value = 1000 + ai_usage.STALE_LIMIT - 1
+            self.assertTrue(ai_usage.get_state("grok")["providers"]["grok"]["stale"])
+            now.return_value += 1
+            missing = ai_usage.get_state("grok")["providers"]["grok"]
+            self.assertNotIn("pct", missing)
+            self.assertEqual(missing["error"], "offline")
+
+    def test_grok_discards_old_omp_account_even_in_a_fresh_cache(self):
+        now = time.time()
+        self.state_file.write_text(json.dumps({"providers": {"grok": {"pct": 30, "ts": now}},
+                                               "fetched_at": now}))
+        with mock.patch.object(ai_usage, "fetch_omp") as omp, \
+                mock.patch.object(ai_usage, "fetch_grok", side_effect=RuntimeError("Native usage failed")):
+            data = ai_usage.get_state("grok")["providers"]["grok"]
+        self.assertNotIn("pct", data)
+        self.assertEqual(data["error"], "Native usage failed")
+        omp.assert_not_called()
+
+    def test_reset_after_fetch_requests_early_cache_refresh(self):
+        state = {
+            "fetched_at": 950,
+            "providers": {
+                "zai": {
+                    "blockers": [
+                        {"label": "5h session", "resets_at": 980_000},
+                    ],
+                },
+            },
+        }
+
+        self.assertTrue(ai_usage.state_needs_refresh(state, "zai", now=1000))
+        self.assertFalse(ai_usage.state_needs_refresh(state, "zai", now=970))
+
+        state["providers"]["zai"]["blockers"][0]["resets_at"] = 940_000
+        self.assertFalse(ai_usage.state_needs_refresh(state, "zai", now=1000))
+
+    def test_legacy_click_and_invalid_cache_trigger_a_new_fetch(self):
+        with mock.patch.object(ai_usage, "fetch_openrouter", return_value={"pct": 40}) as fetch:
+            ai_usage.get_state("openrouter")
+            self.state_file.unlink()
+            ai_usage.get_state("openrouter")
+            self.state_file.write_text("[]")
+            ai_usage.get_state("openrouter")
+            self.assertEqual(fetch.call_count, 3)
 
 
 class OpenRouterUsageTests(unittest.TestCase):
@@ -838,24 +935,6 @@ class BlockerAndOutputTests(unittest.TestCase):
             [item["label"] for item in ai_usage.active_blockers(data, now=998)],
             ["Gemini", "Claude"],
         )
-
-    def test_reset_after_fetch_requests_early_cache_refresh(self):
-        state = {
-            "fetched_at": 950,
-            "providers": {
-                "zai": {
-                    "blockers": [
-                        {"label": "5h session", "resets_at": 980_000},
-                    ],
-                },
-            },
-        }
-
-        self.assertTrue(ai_usage.state_needs_refresh(state, now=1000))
-        self.assertFalse(ai_usage.state_needs_refresh(state, now=970))
-
-        state["providers"]["zai"]["blockers"][0]["resets_at"] = 940_000
-        self.assertFalse(ai_usage.state_needs_refresh(state, now=1000))
 
     def test_exhausted_emit_strikes_value_and_adds_class(self):
         state = {
